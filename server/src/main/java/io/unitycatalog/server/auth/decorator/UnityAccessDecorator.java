@@ -1,0 +1,568 @@
+package io.unitycatalog.server.auth.decorator;
+
+import static io.unitycatalog.server.auth.decorator.AuthorizeKeyLocator.Source.PARAM;
+import static io.unitycatalog.server.auth.decorator.AuthorizeKeyLocator.Source.PAYLOAD;
+import static io.unitycatalog.server.auth.decorator.AuthorizeKeyLocator.Source.SYSTEM;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linecorp.armeria.common.HttpRequest;
+import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.common.SplitHttpResponse;
+import com.linecorp.armeria.server.DecoratingHttpServiceFunction;
+import com.linecorp.armeria.server.HttpService;
+import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.armeria.server.annotation.AnnotatedService;
+import io.netty.util.AttributeKey;
+import io.unitycatalog.server.auth.UnityCatalogAuthorizer;
+import io.unitycatalog.server.auth.annotation.AuthorizeExpression;
+import io.unitycatalog.server.auth.annotation.AuthorizeKey;
+import io.unitycatalog.server.auth.annotation.AuthorizeResourceKey;
+import io.unitycatalog.server.auth.annotation.ResponseAuthorizeFilter;
+import io.unitycatalog.server.exception.BaseException;
+import io.unitycatalog.server.exception.ErrorCode;
+import io.unitycatalog.server.model.SecurableType;
+import io.unitycatalog.server.persist.Repositories;
+import io.unitycatalog.server.persist.UserRepository;
+import io.unitycatalog.server.persist.utils.ExternalLocationUtils;
+import io.unitycatalog.server.utils.ServerProperties;
+import java.lang.reflect.Method;
+import java.lang.reflect.Parameter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Armeria access control Decorator.
+ *
+ * <p>This decorator provides the ability to protect Armeria service methods with per method access
+ * control rules. This decorator is used in conjunction with following 3 annotations to define
+ * authorization rules and identify requests parameters for objects to authorize with:
+ *
+ * <p>1. {@code @AuthorizeExpression} - This defines a Spring Expression Language expression to
+ * evaluate to make an authorization decision.
+ *
+ * <p>2. {@code @AuthorizeResourceKey} - This annotation maps a request value to a unity catalog
+ * resource (catalog, schema, table, etc.) for the authorization context. The source is chosen by
+ * whether the annotated method parameter also carries {@code @Param}: if present, the value is read
+ * from the URL query or path; if absent, from the request body field named by
+ * {@code @AuthorizeResourceKey.key()}. May be used at the method level (server-level resources like
+ * METASTORE) or at the parameter level, and may be specified more than once per method.
+ *
+ * <p>3. {@code @AuthorizeKey} - Works like {@code @AuthorizeResourceKey} for source selection, but
+ * for non-resource request values (operation mode, table type, flag, etc.) exposed directly as a
+ * SpEL variable instead of being mapped to a resource identifier.
+ *
+ * <p>PARAM- and SYSTEM-source locators are read from the request context and authorized inline.
+ * PAYLOAD-source locators need a field from the request body, which is not available yet, so the
+ * decorator stashes a {@link #PAYLOAD_AUTHORIZER} callback that {@link AuthorizationGateConverter}
+ * invokes on the bound body just before the handler runs.
+ */
+public class UnityAccessDecorator implements DecoratingHttpServiceFunction {
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(UnityAccessDecorator.class);
+
+  /**
+   * Client-facing message for every "an authorization check did not run" denial: the gate found no
+   * authorizer, a body carried no keys to evaluate, or a success response was produced without the
+   * check having run. Deliberately uniform and non-specific; the distinguishing detail belongs in
+   * the SECURITY VIOLATION log line, not the response. Public so tests can assert on it without
+   * copying the string.
+   */
+  public static final String ERR_AUTH_NOT_EXECUTED =
+      "Authorization could not be verified for this request";
+
+  /**
+   * Per-request {@link PayloadAuthorizer}, which {@link AuthorizationGateConverter} invokes on the
+   * bound body before the handler runs. Set on every request this decorator handles: the real
+   * authorizer when the method reads keys from the body, {@link
+   * PayloadAuthorizer#NO_BODY_CHECK_REQUIRED} when it does not. Always setting one means the gate
+   * never reads a missing value as "already authorized".
+   */
+  public static final AttributeKey<PayloadAuthorizer> PAYLOAD_AUTHORIZER =
+      AttributeKey.valueOf(UnityAccessDecorator.class, "PAYLOAD_AUTHORIZER");
+
+  private final KeyMapper keyMapper;
+  private final UserRepository userRepository;
+
+  private final UnityAccessEvaluator evaluator;
+
+  // Context attribute key for passing ResultFilter to service methods
+  public static final AttributeKey<ResultFilter> RESULT_FILTER_ATTR =
+      AttributeKey.valueOf(ResultFilter.class, "RESULT_FILTER");
+
+  public UnityAccessDecorator(
+      UnityCatalogAuthorizer authorizer,
+      Repositories repositories,
+      ServerProperties serverProperties)
+      throws BaseException {
+    try {
+      evaluator =
+          new UnityAccessEvaluator(authorizer, serverProperties.isStrictPrivilegeChecksEnabled());
+    } catch (NoSuchMethodException | IllegalAccessException e) {
+      throw new BaseException(ErrorCode.INTERNAL, "Error initializing access evaluator.", e);
+    }
+    keyMapper = repositories.getKeyMapper();
+    userRepository = repositories.getUserRepository();
+  }
+
+  @Override
+  public HttpResponse serve(HttpService delegate, ServiceRequestContext ctx, HttpRequest req)
+      throws Exception {
+    LOGGER.debug("AccessDecorator checking {}", req.path());
+
+    Method method = findServiceMethod(ctx.config().service());
+    if (method == null) {
+      throw new RuntimeException("Couldn't unwrap service.");
+    }
+
+    // Find the authorization parameters to use for this service method.
+    String expression = findAuthorizeExpression(method);
+    List<AuthorizeKeyLocator> locators = findAuthorizeKeys(method);
+
+    // Check for response filtering annotation
+    Optional<ResponseAuthorizeFilter> filterAnnotation =
+        Optional.ofNullable(method.getAnnotation(ResponseAuthorizeFilter.class));
+
+    if (expression == null) {
+      throw new RuntimeException("No authorization expression found.");
+    }
+    UUID principal = userRepository.findPrincipalId();
+    return authorizeByRequest(
+        delegate, ctx, method, req, principal, locators, expression, filterAnnotation);
+  }
+
+  private HttpResponse authorizeByRequest(
+      HttpService delegate,
+      ServiceRequestContext ctx,
+      Method method,
+      HttpRequest req,
+      UUID principal,
+      List<AuthorizeKeyLocator> locators,
+      String expression,
+      Optional<ResponseAuthorizeFilter> filterAnnotation)
+      throws Exception {
+    //
+    // Based on the query and payload parameters defined on the service method (that
+    // have been gathered as Locators), we'll attempt to find the entity/resource that
+    // we want to authorize against.
+
+    Map<SecurableType, Object> resourceKeys = new HashMap<>();
+    Map<String, Object> nonResourceValues = new HashMap<>();
+
+    // Split up the locators by type, because we have to extract the value from the request
+    // different ways for different types
+
+    List<AuthorizeKeyLocator> systemLocators =
+        locators.stream().filter(l -> l.getSource().equals(SYSTEM)).toList();
+    List<AuthorizeKeyLocator> paramLocators =
+        locators.stream().filter(l -> l.getSource().equals(PARAM)).toList();
+    List<AuthorizeKeyLocator> payloadLocators =
+        locators.stream().filter(l -> l.getSource().equals(PAYLOAD)).toList();
+    // Resource keys that are conditionally skipped (their skipWhen variable decides at resolve
+    // time). Applied by mapResourceKeys, once that variable has been populated.
+    List<AuthorizeKeyLocator> conditionalResourceLocators =
+        locators.stream()
+            .filter(l -> l.getSkipWhen() != null && !l.getSkipWhen().isEmpty())
+            .toList();
+
+    // Add system-type keys, just metastore for now.
+    systemLocators.forEach(l -> resourceKeys.put(l.getType().get(), "metastore"));
+
+    // Extract the query/path parameter values just by grabbing them from the request
+    paramLocators.forEach(
+        l -> {
+          String value =
+              ctx.pathParam(l.getKey()) != null
+                  ? ctx.pathParam(l.getKey())
+                  : ctx.queryParam(l.getKey());
+          if (l.getType().isPresent()) {
+            resourceKeys.put(l.getType().get(), value);
+          } else {
+            nonResourceValues.put(l.getVariableName(), value);
+          }
+        });
+
+    EvaluationAction evaluateAction =
+        filterAnnotation
+            .<EvaluationAction>map(x -> new ResultFilterAction(ctx, method))
+            .orElseGet(() -> new RequestEvaluationAction(method));
+
+    if (payloadLocators.isEmpty()) {
+      // All keys are already available, so authorize now.
+      Map<SecurableType, UUID> resourceIds =
+          mapResourceKeys(conditionalResourceLocators, resourceKeys, nonResourceValues);
+      evaluateAction.runBeforeRequest(principal, expression, resourceIds, nonResourceValues);
+      // The method may still bind a body (e.g. updateCatalog authorizes on the "name" path param),
+      // so the gate converter still runs and needs to be told the check is done.
+      ctx.setAttr(PAYLOAD_AUTHORIZER, PayloadAuthorizer.NO_BODY_CHECK_REQUIRED);
+    } else {
+      // Some keys live in the body, so defer: the gate converter runs this on the bound object,
+      // which is what the handler will use. beforeRequest is called at the end of authorizePayload,
+      // once those keys are populated.
+      LOGGER.debug("Deferring PAYLOAD authorization to the request converter.");
+      ctx.setAttr(
+          PAYLOAD_AUTHORIZER,
+          (body, mapper) ->
+              authorizePayload(
+                  body,
+                  mapper,
+                  payloadLocators,
+                  conditionalResourceLocators,
+                  resourceKeys,
+                  nonResourceValues,
+                  principal,
+                  expression,
+                  evaluateAction));
+    }
+
+    // runAfterRequest confirms at response time that beforeRequest actually ran.
+    return evaluateAction.runAfterRequest(delegate.serve(ctx, req));
+  }
+
+  /**
+   * How a request is authorized. Subclasses implement {@link #beforeRequest}; {@link
+   * #runAfterRequest} is final because it must be the only place a response is split, so an action
+   * is never double-wrapped. It waits for headers only, to avoid buffering large LIST responses.
+   *
+   * <p>On success it confirms {@code beforeRequest} actually ran, catching a PAYLOAD method whose
+   * deferred callback never fired. This is a backstop only: the handler has already run, so its
+   * side effects are not rolled back. Prevention is the gate converter authorizing before the
+   * handler; see {@link #PAYLOAD_AUTHORIZER}.
+   *
+   * <p>When authorization already ran inline and no subclass needs {@link #successCheck}, there is
+   * nothing to verify and the response is returned unsplit.
+   */
+  private abstract class EvaluationAction {
+    private final Method method;
+    private final AtomicBoolean beforeRequestRan = new AtomicBoolean(false);
+
+    EvaluationAction(Method method) {
+      this.method = method;
+    }
+
+    /**
+     * Authorizes this request. Call this rather than {@link #beforeRequest}: it records that the
+     * check ran, which {@link #runAfterRequest} verifies. The flag is set only once {@code
+     * beforeRequest} returns, so a denial leaves it unset.
+     */
+    final void runBeforeRequest(
+        UUID principal,
+        String expression,
+        Map<SecurableType, UUID> resourceIds,
+        Map<String, Object> nonResourceValues) {
+      beforeRequest(principal, expression, resourceIds, nonResourceValues);
+      beforeRequestRan.set(true);
+    }
+
+    /**
+     * Evaluates access, throwing a {@link BaseException} to deny. Implemented by subclasses;
+     * callers use {@link #runBeforeRequest} instead so the check is recorded.
+     */
+    protected abstract void beforeRequest(
+        UUID principal,
+        String expression,
+        Map<SecurableType, UUID> resourceIds,
+        Map<String, Object> nonResourceValues);
+
+    /** The annotated method being guarded, for use in subclass log messages. */
+    protected final Method method() {
+      return method;
+    }
+
+    /**
+     * Whether {@link #successCheck} has anything to check. Return false when it is a no-op, so the
+     * fast path can skip splitting the response.
+     */
+    protected abstract boolean needsSuccessCheck();
+
+    /**
+     * Subclass-specific success check, run only after {@code beforeRequest} is confirmed to have
+     * run, and only when {@link #needsSuccessCheck} is true. Throw a {@link BaseException} to deny.
+     */
+    protected abstract void successCheck();
+
+    final HttpResponse runAfterRequest(HttpResponse response) {
+      // Fast path: authorization already ran synchronously (PARAM/SYSTEM keys), and no subclass
+      // wants a success-time check, so there is nothing left to verify. Return the response as-is
+      // rather than splitting it, which would add a stream hop for a check whose answer is known.
+      if (beforeRequestRan.get() && !needsSuccessCheck()) {
+        return response;
+      }
+      SplitHttpResponse split = response.split();
+      return HttpResponse.of(
+          split
+              .headers()
+              .thenApply(
+                  headers -> {
+                    if (headers.status().isSuccess()) {
+                      try {
+                        if (!beforeRequestRan.get()) {
+                          LOGGER.error(
+                              "SECURITY VIOLATION: Method {} produced a success response without "
+                                  + "running authorization; denying the request.",
+                              method.getName());
+                          throw new BaseException(
+                              ErrorCode.PERMISSION_DENIED, ERR_AUTH_NOT_EXECUTED);
+                        }
+                        if (needsSuccessCheck()) {
+                          successCheck();
+                        }
+                      } catch (RuntimeException e) {
+                        // Abort the not-yet-consumed body before failing closed so the handler's
+                        // response payload is never streamed to the client.
+                        split.body().abort();
+                        throw e;
+                      }
+                    }
+                    return HttpResponse.of(headers, split.body());
+                  }));
+    }
+  }
+
+  private class RequestEvaluationAction extends EvaluationAction {
+
+    RequestEvaluationAction(Method method) {
+      super(method);
+    }
+
+    @Override
+    protected void beforeRequest(
+        UUID principal,
+        String expression,
+        Map<SecurableType, UUID> resourceIds,
+        Map<String, Object> nonResourceValues) {
+      if (!evaluator.evaluate(principal, expression, resourceIds, nonResourceValues)) {
+        throw new BaseException(ErrorCode.PERMISSION_DENIED, "Access denied.");
+      }
+    }
+
+    @Override
+    protected boolean needsSuccessCheck() {
+      return false;
+    }
+
+    @Override
+    protected void successCheck() {}
+  }
+
+  private class ResultFilterAction extends EvaluationAction {
+    private final ServiceRequestContext ctx;
+    private volatile ResultFilter resultFilter = null;
+
+    ResultFilterAction(ServiceRequestContext ctx, Method method) {
+      super(method);
+      this.ctx = ctx;
+    }
+
+    @Override
+    protected void beforeRequest(
+        UUID principal,
+        String expression,
+        Map<SecurableType, UUID> resourceIds,
+        Map<String, Object> nonResourceValues) {
+      // Handlers declare @Param("include_browse") so Armeria validates the value.
+      ResponseAuthorizeFilter annotation = method().getAnnotation(ResponseAuthorizeFilter.class);
+      Boolean includeBrowse = ctx.queryParams().getBoolean("include_browse");
+      String browseExpression = Boolean.TRUE.equals(includeBrowse) ? annotation.browse() : "";
+      // Leave invalid Boolean values to Armeria's parameter binding.
+      if (!annotation.isList()
+          && browseExpression.isEmpty()
+          && (includeBrowse != null || ctx.queryParam("include_browse") == null)
+          && !evaluator.evaluate(principal, expression, resourceIds, nonResourceValues)) {
+        throw new BaseException(ErrorCode.PERMISSION_DENIED, "Access denied.");
+      }
+      resultFilter =
+          new ResultFilter(
+              evaluator,
+              principal,
+              expression,
+              browseExpression,
+              resourceIds,
+              nonResourceValues,
+              keyMapper);
+      ctx.setAttr(RESULT_FILTER_ATTR, resultFilter);
+    }
+
+    @Override
+    protected boolean needsSuccessCheck() {
+      // The handler is trusted to call applyResponseFilter(); nothing upstream can confirm it did,
+      // so this action always needs the response-time check.
+      return true;
+    }
+
+    @Override
+    protected void successCheck() {
+      // beforeRequestRan is already confirmed by the base class, so resultFilter is non-null here.
+      // Additionally require the handler to have actually applied the response filter.
+      if (!resultFilter.wasCalled()) {
+        LOGGER.error(
+            "SECURITY VIOLATION: Method {} with @ResponseAuthorizeFilter did not call "
+                + "applyResponseFilter(). This is a security vulnerability!",
+            method().getName());
+        throw new BaseException(ErrorCode.PERMISSION_DENIED, ERR_AUTH_NOT_EXECUTED);
+      }
+    }
+  }
+
+  private Map<SecurableType, UUID> mapResourceKeys(
+      List<AuthorizeKeyLocator> conditionalLocators,
+      Map<SecurableType, Object> resourceKeys,
+      Map<String, Object> nonResourceValues) {
+    // Drop conditionally-skipped resource keys first, so a key that does not apply to this request
+    // shape is never resolved (and cannot fail resolving).
+    applyConditionalSkips(conditionalLocators, resourceKeys, nonResourceValues);
+    Map<SecurableType, UUID> resourceIds = keyMapper.mapResourceKeys(resourceKeys);
+
+    if (resourceKeys.containsKey(SecurableType.EXTERNAL_LOCATION)) {
+      // KeyMapper will try to map a path of EXTERNAL_LOCATION to any data securable if the path
+      // belongs to it, instead of just the external location. This new variable is introduced so
+      // that auth expression can easily check if the input path overlaps with any data securable.
+      boolean noOverlapWithDataSecurable =
+          ExternalLocationUtils.DATA_SECURABLE_TYPES.stream()
+              .allMatch(type -> resourceIds.get(type) == null);
+      nonResourceValues.put("no_overlap_with_data_securable", noOverlapWithDataSecurable);
+    }
+
+    if (!resourceIds.keySet().containsAll(resourceKeys.keySet())) {
+      LOGGER.warn("Some resource keys have unresolved ids.");
+    }
+
+    LOGGER.debug("resourceIds = {}", resourceIds);
+    return resourceIds;
+  }
+
+  private static String findAuthorizeExpression(Method method) {
+    // TODO: Cache this by method
+
+    AuthorizeExpression annotation = method.getAnnotation(AuthorizeExpression.class);
+
+    if (annotation != null) {
+      LOGGER.debug("authorize expression = {}", annotation.value());
+      return annotation.value();
+    } else {
+      LOGGER.debug("authorize = (none found)");
+      return null;
+    }
+  }
+
+  private static List<AuthorizeKeyLocator> findAuthorizeKeys(Method method) {
+    // TODO: Cache this by method
+
+    List<AuthorizeKeyLocator> locators = new ArrayList<>();
+
+    AuthorizeResourceKey methodKey = method.getAnnotation(AuthorizeResourceKey.class);
+
+    // If resource is on the method, its source is from a global/system variable
+    if (methodKey != null) {
+      locators.add(
+          AuthorizeKeyLocator.builder()
+              .source(SYSTEM)
+              .type(Optional.of(methodKey.value()))
+              .build());
+    }
+
+    for (Parameter parameter : method.getParameters()) {
+      AuthorizeResourceKey[] allResourceKeys =
+          parameter.getAnnotationsByType(AuthorizeResourceKey.class);
+      for (AuthorizeResourceKey key : allResourceKeys) {
+        locators.add(AuthorizeKeyLocator.from(key, parameter));
+      }
+
+      AuthorizeKey[] allNonResourceKeys = parameter.getAnnotationsByType(AuthorizeKey.class);
+      for (AuthorizeKey key : allNonResourceKeys) {
+        locators.add(AuthorizeKeyLocator.from(key, parameter));
+      }
+    }
+    return locators;
+  }
+
+  private static Method findServiceMethod(HttpService httpService) {
+    // as() searches the whole decorator chain, so this does not depend on how many decorators sit
+    // between the route and the annotated service.
+    HttpService annotated = httpService.as(AnnotatedService.class);
+    if (annotated instanceof AnnotatedService service) {
+
+      LOGGER.debug(
+          "serviceName = {}, methodName = {}",
+          service.serviceClass().getName(),
+          service.methodName());
+
+      return service.method();
+    } else {
+      return null;
+    }
+  }
+
+  /**
+   * Authorizes against the already-bound body, invoked by {@link AuthorizationGateConverter} after
+   * binding and before the handler. Reads locator keys off the exact object the handler will use,
+   * so there is no differential between what is authorized and what executes. A malformed body
+   * never reaches here; it fails binding as a 400. Throws {@link BaseException} with {@link
+   * ErrorCode#PERMISSION_DENIED} to deny.
+   */
+  private void authorizePayload(
+      Object body,
+      ObjectMapper mapper,
+      List<AuthorizeKeyLocator> payloadLocators,
+      List<AuthorizeKeyLocator> conditionalLocators,
+      Map<SecurableType, Object> resourceKeys,
+      Map<String, Object> nonResourceValues,
+      UUID principal,
+      String expression,
+      EvaluationAction evaluateAction) {
+    // A null body (e.g. the JSON literal "null") carries no authorization keys, so fail closed
+    // rather than NPE below.
+    if (body == null) {
+      throw new BaseException(ErrorCode.PERMISSION_DENIED, ERR_AUTH_NOT_EXECUTED);
+    }
+
+    // Convert the typed body to a JSON map once, shared by the field-lookup locators. (Extractor
+    // locators read the typed body object directly and ignore this map.)
+    Map<String, Object> bodyMap = mapper.convertValue(body, new TypeReference<>() {});
+
+    payloadLocators.forEach(
+        l -> {
+          Object value = l.findPayloadValue(body, bodyMap);
+          if (l.getType().isPresent()) {
+            resourceKeys.put(l.getType().get(), value);
+          } else {
+            if (value != null && value.getClass().isEnum()) {
+              // Convert enums to their string representation
+              value = value.toString();
+            }
+            nonResourceValues.put(l.getVariableName(), value);
+          }
+        });
+
+    Map<SecurableType, UUID> resourceIds =
+        mapResourceKeys(conditionalLocators, resourceKeys, nonResourceValues);
+    evaluateAction.runBeforeRequest(principal, expression, resourceIds, nonResourceValues);
+  }
+
+  /**
+   * Drops each conditional resource key whose {@code skipWhen} variable evaluated truthy, so it is
+   * not resolved to an id (and cannot fail resolving) on the request shape it does not apply to.
+   * Called first by {@link #mapResourceKeys}, once the deciding variables have been populated.
+   */
+  private static void applyConditionalSkips(
+      List<AuthorizeKeyLocator> conditionalLocators,
+      Map<SecurableType, Object> resourceKeys,
+      Map<String, Object> nonResourceValues) {
+    for (AuthorizeKeyLocator locator : conditionalLocators) {
+      if (locator.getType().isPresent() && isTruthy(nonResourceValues.get(locator.getSkipWhen()))) {
+        resourceKeys.remove(locator.getType().get());
+      }
+    }
+  }
+
+  private static boolean isTruthy(Object value) {
+    return value instanceof Boolean b ? b : Boolean.parseBoolean(String.valueOf(value));
+  }
+}

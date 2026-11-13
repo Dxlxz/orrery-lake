@@ -1,0 +1,767 @@
+package io.unitycatalog.server.sdk.access;
+
+import static io.unitycatalog.client.model.PathOperation.PATH_CREATE_TABLE;
+import static io.unitycatalog.client.model.PathOperation.PATH_READ;
+import static io.unitycatalog.client.model.PathOperation.PATH_READ_WRITE;
+import static io.unitycatalog.server.utils.TestUtils.CATALOG_NAME;
+import static io.unitycatalog.server.utils.TestUtils.SCHEMA_FULL_NAME;
+import static io.unitycatalog.server.utils.TestUtils.TEST_AWS_MASTER_ROLE_ARN;
+import static io.unitycatalog.server.utils.TestUtils.assertPermissionDenied;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+
+import io.unitycatalog.client.ApiClient;
+import io.unitycatalog.client.api.CredentialsApi;
+import io.unitycatalog.client.api.ExternalLocationsApi;
+import io.unitycatalog.client.api.SchemasApi;
+import io.unitycatalog.client.api.TablesApi;
+import io.unitycatalog.client.api.TemporaryCredentialsApi;
+import io.unitycatalog.client.api.VolumesApi;
+import io.unitycatalog.client.model.AwsCredentials;
+import io.unitycatalog.client.model.AwsIamRoleRequest;
+import io.unitycatalog.client.model.ColumnInfo;
+import io.unitycatalog.client.model.ColumnTypeName;
+import io.unitycatalog.client.model.CreateCredentialRequest;
+import io.unitycatalog.client.model.CreateExternalLocation;
+import io.unitycatalog.client.model.CreateSchema;
+import io.unitycatalog.client.model.CreateTable;
+import io.unitycatalog.client.model.CreateVolumeRequestContent;
+import io.unitycatalog.client.model.CredentialInfo;
+import io.unitycatalog.client.model.CredentialPurpose;
+import io.unitycatalog.client.model.DataSourceFormat;
+import io.unitycatalog.client.model.ExternalLocationInfo;
+import io.unitycatalog.client.model.GenerateTemporaryPathCredential;
+import io.unitycatalog.client.model.GenerateTemporaryVolumeCredential;
+import io.unitycatalog.client.model.PathOperation;
+import io.unitycatalog.client.model.PermissionsChange;
+import io.unitycatalog.client.model.Privilege;
+import io.unitycatalog.client.model.SecurableType;
+import io.unitycatalog.client.model.TableInfo;
+import io.unitycatalog.client.model.TableType;
+import io.unitycatalog.client.model.TemporaryCredentials;
+import io.unitycatalog.client.model.UpdatePermissions;
+import io.unitycatalog.client.model.VolumeInfo;
+import io.unitycatalog.client.model.VolumeOperation;
+import io.unitycatalog.client.model.VolumeType;
+import io.unitycatalog.server.base.ServerConfig;
+import io.unitycatalog.server.exception.ErrorCode;
+import io.unitycatalog.server.persist.ManagedResourceType;
+import io.unitycatalog.server.persist.StorageCleanupTaskRepository;
+import io.unitycatalog.server.persist.dao.StorageCleanupTaskDAO;
+import io.unitycatalog.server.persist.model.Privileges;
+import io.unitycatalog.server.persist.utils.TransactionManager;
+import io.unitycatalog.server.service.credential.CloudCredentialVendor;
+import io.unitycatalog.server.service.credential.CredentialContext;
+import io.unitycatalog.server.service.credential.aws.AwsCredentialGenerator;
+import io.unitycatalog.server.utils.NormalizedURL;
+import io.unitycatalog.server.utils.ServerProperties;
+import io.unitycatalog.server.utils.TestUtils;
+import java.time.Instant;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.Callable;
+import lombok.Getter;
+import lombok.SneakyThrows;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import software.amazon.awssdk.services.sts.model.Credentials;
+
+public class TemporaryPathCredentialAccessControlTest extends SdkAccessControlBaseCRUDTest {
+
+  private static final String TEST_EXTERNAL_LOCATION_NAME = "test_ext_loc";
+  private static final String TEST_EXTERNAL_LOCATION_URL = "s3://test-bucket0/path/to/data";
+  private static final String TEST_CREDENTIAL_NAME = "test_credential";
+  private static final String DUMMY_ROLE_ARN = "arn:aws:iam::123456789012:role/test-role";
+
+  private static final String READONLY_EMAIL = "readonly@example.com";
+  private static final String READWRITE_EMAIL = "readwrite@example.com";
+  private static final String CREATE_TABLE_EMAIL = "createtable@example.com";
+  private static final String UNAUTHORIZED_EMAIL = "unauthorized@example.com";
+
+  /** User dedicated to creating external tables and volumes for testing. */
+  private static final String TABLE_VOLUME_OWNER_EMAIL = "table_volume_owner@example.com";
+
+  private TemporaryCredentialsApi adminTempCredsApi;
+
+  private TemporaryCredentialsApi locationOwnerTempCredsApi;
+  private ApiClient tableVolumeCreatorApiClient;
+
+  @Mock CloudCredentialVendor mockCloudCredentialVendor;
+
+  @Override
+  protected void setUpProperties() {
+    super.setUpProperties();
+    serverProperties.put(
+        ServerProperties.Property.AWS_MASTER_ROLE_ARN.getKey(), TEST_AWS_MASTER_ROLE_ARN);
+  }
+
+  // This is access control test. So it doesn't care about the actual credential vending. Just
+  // mock with something that returns credential.
+  private void setupMockCloudCredentialVendor() {
+    // Mock function needs the credential of `server.model` package.
+    io.unitycatalog.server.model.TemporaryCredentials credential =
+        new io.unitycatalog.server.model.TemporaryCredentials()
+            .awsTempCredentials(
+                new io.unitycatalog.server.model.AwsCredentials()
+                    .accessKeyId("test-access-key-id")
+                    .secretAccessKey("test-secret-access-key")
+                    .sessionToken("test-session-token"))
+            .expirationTime(System.currentTimeMillis() + 6000);
+    mockCloudCredentialVendor = mock(CloudCredentialVendor.class);
+    doReturn(credential).when(mockCloudCredentialVendor).vendCredential(any());
+    cloudCredentialVendor = mockCloudCredentialVendor;
+  }
+
+  @SneakyThrows
+  @BeforeEach
+  @Override
+  public void setUp() {
+    setupMockCloudCredentialVendor();
+    super.setUp();
+    CredentialsApi adminCredentialsApi = new CredentialsApi(TestUtils.createApiClient(adminConfig));
+    adminTempCredsApi = new TemporaryCredentialsApi(TestUtils.createApiClient(adminConfig));
+
+    // Create a credential
+    CreateCredentialRequest createCredentialRequest =
+        new CreateCredentialRequest()
+            .name(TEST_CREDENTIAL_NAME)
+            .comment("Test credential for temporary path credentials")
+            .purpose(CredentialPurpose.STORAGE)
+            .awsIamRole(new AwsIamRoleRequest().roleArn(DUMMY_ROLE_ARN));
+    CredentialInfo credentialInfo = adminCredentialsApi.createCredential(createCredentialRequest);
+    assertThat(credentialInfo).isNotNull();
+
+    // Create a user and grant it permission to create a location
+    String locationOwnerEmail = "location_owner@example.com";
+    ApiClient locationOwnerClientApi = createApiClientForNewUser(locationOwnerEmail, List.of());
+    ExternalLocationsApi locationOwnerExternalLocationsApi =
+        new ExternalLocationsApi(locationOwnerClientApi);
+    locationOwnerTempCredsApi = new TemporaryCredentialsApi(locationOwnerClientApi);
+    grantPermissions(
+        locationOwnerEmail,
+        SecurableType.METASTORE,
+        METASTORE_NAME,
+        Privileges.CREATE_EXTERNAL_LOCATION);
+    grantPermissions(
+        locationOwnerEmail,
+        SecurableType.CREDENTIAL,
+        TEST_CREDENTIAL_NAME,
+        Privileges.CREATE_EXTERNAL_LOCATION);
+
+    // Create external location as locationOwner (not admin)
+    CreateExternalLocation createExternalLocation =
+        new CreateExternalLocation()
+            .name(TEST_EXTERNAL_LOCATION_NAME)
+            .url(TEST_EXTERNAL_LOCATION_URL)
+            .credentialName(TEST_CREDENTIAL_NAME)
+            .comment("Test external location");
+    ExternalLocationInfo externalLocationInfo =
+        locationOwnerExternalLocationsApi.createExternalLocation(createExternalLocation);
+    assertThat(externalLocationInfo).isNotNull();
+
+    // Create a user and grant it permission to create external tables and volumes
+    tableVolumeCreatorApiClient =
+        createApiClientForNewUser(
+            TABLE_VOLUME_OWNER_EMAIL,
+            List.of(Privileges.CREATE_EXTERNAL_TABLE, Privileges.CREATE_EXTERNAL_VOLUME));
+    grantPermissions(
+        TABLE_VOLUME_OWNER_EMAIL, SecurableType.CATALOG, CATALOG_NAME, Privileges.USE_CATALOG);
+    grantPermissions(
+        TABLE_VOLUME_OWNER_EMAIL,
+        SecurableType.SCHEMA,
+        SCHEMA_FULL_NAME,
+        Privileges.USE_SCHEMA,
+        Privileges.CREATE_TABLE,
+        Privileges.CREATE_VOLUME);
+  }
+
+  @SneakyThrows
+  private ApiClient createApiClientForNewUser(String email, List<Privileges> privileges) {
+    createTestUser(email);
+    for (Privileges privilege : privileges) {
+      grantPermissions(
+          email, SecurableType.EXTERNAL_LOCATION, TEST_EXTERNAL_LOCATION_NAME, privilege);
+    }
+    ServerConfig config = createTestUserServerConfig(email);
+    return TestUtils.createApiClient(config);
+  }
+
+  private TemporaryCredentialsApi createTempCredApiForNewUser(
+      String email, List<Privileges> privileges) {
+    return new TemporaryCredentialsApi(createApiClientForNewUser(email, privileges));
+  }
+
+  @Getter
+  private static class TestCase {
+    public static final Set<PathOperation> ALL_OPERATIONS = Set.of(PathOperation.values());
+    public static final Set<PathOperation> READ_WRITE = Set.of(PATH_READ, PATH_READ_WRITE);
+    public static final Set<PathOperation> READONLY = Set.of(PATH_READ);
+    public static final Set<PathOperation> CREATE_EXTERNAL_TABLE = Set.of(PATH_CREATE_TABLE);
+
+    private final TemporaryCredentialsApi api;
+    private final Set<PathOperation> expectOperations;
+
+    TestCase(TemporaryCredentialsApi api, Set<PathOperation> expectOperations) {
+      this.api = api;
+      this.expectOperations = expectOperations;
+    }
+  }
+
+  @Test
+  public void testTemporaryPathCredentialsAuthorization() throws Exception {
+    // 1. Test permission against external location itself. No data securables exist yet.
+
+    TemporaryCredentialsApi readOnlyTempCredsApi =
+        createTempCredApiForNewUser(READONLY_EMAIL, List.of(Privileges.READ_FILES));
+    ApiClient readWriteUserApiClient =
+        createApiClientForNewUser(
+            READWRITE_EMAIL, List.of(Privileges.READ_FILES, Privileges.WRITE_FILES));
+    TemporaryCredentialsApi readWriteTempCredsApi =
+        new TemporaryCredentialsApi(readWriteUserApiClient);
+    TemporaryCredentialsApi createTableTempCredsApi =
+        createTempCredApiForNewUser(CREATE_TABLE_EMAIL, List.of(Privileges.CREATE_EXTERNAL_TABLE));
+    TemporaryCredentialsApi unauthorizedTempCredsApi =
+        createTempCredApiForNewUser(UNAUTHORIZED_EMAIL, List.of());
+
+    // For URLs under the external location, follow external location permission. The metastore
+    // admin has no path-credential bypass: without READ_FILES/WRITE_FILES (or ownership) it is
+    // denied like any unprivileged user.
+
+    List<String> matchingUrls =
+        List.of(TEST_EXTERNAL_LOCATION_URL, TEST_EXTERNAL_LOCATION_URL + "/subdir/nested");
+    testPathCredentials(
+        matchingUrls,
+        List.of(
+            new TestCase(adminTempCredsApi, Set.of()),
+            new TestCase(locationOwnerTempCredsApi, TestCase.ALL_OPERATIONS),
+            new TestCase(readWriteTempCredsApi, TestCase.READ_WRITE),
+            new TestCase(readOnlyTempCredsApi, TestCase.READONLY),
+            new TestCase(createTableTempCredsApi, TestCase.CREATE_EXTERNAL_TABLE),
+            new TestCase(unauthorizedTempCredsApi, Set.of())));
+
+    // For URLs outside every external location and data securable, nothing resolves to authorize
+    // against, so no one -- including the metastore admin -- can get a credential.
+
+    List<String> nonMatchingUrls = List.of("s3://test-bucket0/different/path");
+    testPathCredentials(
+        nonMatchingUrls,
+        List.of(
+            new TestCase(adminTempCredsApi, Set.of()),
+            new TestCase(locationOwnerTempCredsApi, Set.of()),
+            new TestCase(unauthorizedTempCredsApi, Set.of())));
+
+    // 2. Test permission when a table exists under the path
+
+    createExternalTable(TEST_EXTERNAL_LOCATION_URL + "/tables/test_table");
+
+    // Before granting permission, no regular user can access the table, not even the location owner
+
+    testPathCredentials(
+        List.of(
+            TEST_EXTERNAL_LOCATION_URL + "/tables",
+            TEST_EXTERNAL_LOCATION_URL + "/tables/test_table",
+            TEST_EXTERNAL_LOCATION_URL + "/tables/test_table/subdir"),
+        List.of(
+            new TestCase(locationOwnerTempCredsApi, Set.of()),
+            new TestCase(readWriteTempCredsApi, Set.of()),
+            new TestCase(readOnlyTempCredsApi, Set.of()),
+            new TestCase(createTableTempCredsApi, Set.of()),
+            new TestCase(unauthorizedTempCredsApi, Set.of())));
+
+    // Grant table permissions
+    grantPermissions(
+        READONLY_EMAIL, SecurableType.TABLE, TestUtils.TABLE_FULL_NAME, Privileges.SELECT);
+    grantPermissions(
+        READWRITE_EMAIL,
+        SecurableType.TABLE,
+        TestUtils.TABLE_FULL_NAME,
+        Privileges.SELECT,
+        Privileges.MODIFY);
+    for (String email : List.of(READONLY_EMAIL, READWRITE_EMAIL)) {
+      grantPermissions(
+          email, SecurableType.CATALOG, TestUtils.CATALOG_NAME, Privileges.USE_CATALOG);
+      grantPermissions(
+          email, SecurableType.SCHEMA, TestUtils.SCHEMA_FULL_NAME, Privileges.USE_SCHEMA);
+    }
+
+    testPathCredentials(
+        List.of(
+            TEST_EXTERNAL_LOCATION_URL + "/tables/test_table",
+            TEST_EXTERNAL_LOCATION_URL + "/tables/test_table/subdir"),
+        List.of(
+            // Admin is not the table owner and has no SELECT/MODIFY, so it is denied like anyone
+            // else once the path resolves to the table.
+            new TestCase(adminTempCredsApi, Set.of()),
+            new TestCase(locationOwnerTempCredsApi, Set.of()),
+            new TestCase(readWriteTempCredsApi, TestCase.READ_WRITE),
+            new TestCase(readOnlyTempCredsApi, TestCase.READONLY),
+            new TestCase(createTableTempCredsApi, Set.of()),
+            new TestCase(unauthorizedTempCredsApi, Set.of())));
+
+    // 3. Test permission when a volume exists under the path owned by TABLE_VOLUME_OWNER_EMAIL
+    createExternalVolume(TEST_EXTERNAL_LOCATION_URL + "/volumes/test_volume");
+    TemporaryCredentialsApi volumeOwnerApi =
+        new TemporaryCredentialsApi(tableVolumeCreatorApiClient);
+
+    // Before granting permission, no regular user except owner can access the volume. The location
+    // owner can not access either.
+
+    testPathCredentials(
+        List.of(TEST_EXTERNAL_LOCATION_URL + "/volumes"),
+        List.of(new TestCase(readWriteTempCredsApi, Set.of())));
+    testPathCredentials(
+        List.of(
+            TEST_EXTERNAL_LOCATION_URL + "/volumes/test_volume",
+            TEST_EXTERNAL_LOCATION_URL + "/volumes/test_volume/subdir"),
+        List.of(new TestCase(volumeOwnerApi, TestCase.READ_WRITE)));
+    testPathCredentials(
+        List.of(
+            TEST_EXTERNAL_LOCATION_URL + "/volumes",
+            TEST_EXTERNAL_LOCATION_URL + "/volumes/test_volume",
+            TEST_EXTERNAL_LOCATION_URL + "/volumes/test_volume/subdir"),
+        List.of(
+            new TestCase(locationOwnerTempCredsApi, Set.of()),
+            new TestCase(readOnlyTempCredsApi, Set.of()),
+            new TestCase(createTableTempCredsApi, Set.of()),
+            new TestCase(readWriteTempCredsApi, Set.of()),
+            new TestCase(unauthorizedTempCredsApi, Set.of())));
+
+    // Grant readonly volume permissions
+    grantPermissions(
+        READONLY_EMAIL, SecurableType.VOLUME, TestUtils.VOLUME_FULL_NAME, Privileges.READ_VOLUME);
+
+    testPathCredentials(
+        List.of(
+            TEST_EXTERNAL_LOCATION_URL + "/volumes/test_volume",
+            TEST_EXTERNAL_LOCATION_URL + "/volumes/test_volume/subdir"),
+        List.of(
+            new TestCase(adminTempCredsApi, Set.of()),
+            new TestCase(locationOwnerTempCredsApi, Set.of()),
+            new TestCase(readWriteTempCredsApi, Set.of()),
+            new TestCase(readOnlyTempCredsApi, TestCase.READONLY),
+            new TestCase(createTableTempCredsApi, Set.of()),
+            new TestCase(unauthorizedTempCredsApi, Set.of())));
+
+    // TODO: Test permission when a managed storage, or a model version exists under the path,
+    //  once they are supported.
+
+    // Finally, the parent path now has data securables (a table and a volume) beneath it, so it
+    // resolves to more than one securable and is rejected outright -- even for the external
+    // location's own owner.
+    testPathCredentials(
+        List.of(TEST_EXTERNAL_LOCATION_URL),
+        List.of(new TestCase(locationOwnerTempCredsApi, Set.of())));
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = VolumeType.class,
+      names = {"MANAGED", "EXTERNAL"})
+  @SneakyThrows
+  public void testVolumeWritePrivileges(VolumeType volumeType) {
+    String schemaName = "volume_schema";
+    String schemaFullName = CATALOG_NAME + "." + schemaName;
+    grantPermissions(
+        "admin",
+        SecurableType.EXTERNAL_LOCATION,
+        TEST_EXTERNAL_LOCATION_NAME,
+        Privileges.CREATE_MANAGED_STORAGE);
+    new SchemasApi(adminApiClient)
+        .createSchema(
+            new CreateSchema()
+                .catalogName(CATALOG_NAME)
+                .name(schemaName)
+                .storageRoot(TEST_EXTERNAL_LOCATION_URL + "/managed"));
+    grantPermissions(
+        TABLE_VOLUME_OWNER_EMAIL,
+        SecurableType.SCHEMA,
+        schemaFullName,
+        Privileges.USE_SCHEMA,
+        Privileges.CREATE_VOLUME);
+    VolumeInfo volume =
+        new VolumesApi(tableVolumeCreatorApiClient)
+            .createVolume(
+                new CreateVolumeRequestContent()
+                    .name("volume")
+                    .catalogName(CATALOG_NAME)
+                    .schemaName(schemaName)
+                    .volumeType(volumeType)
+                    .storageLocation(
+                        volumeType == VolumeType.EXTERNAL
+                            ? TEST_EXTERNAL_LOCATION_URL + "/volume"
+                            : null));
+    TemporaryCredentialsApi api = createTempCredApiForNewUser(READWRITE_EMAIL, List.of());
+    testVolumeCredentials(api, volume, false, false);
+
+    grantPermissions(READWRITE_EMAIL, SecurableType.CATALOG, CATALOG_NAME, Privileges.USE_CATALOG);
+    grantPermissions(READWRITE_EMAIL, SecurableType.SCHEMA, schemaFullName, Privileges.USE_SCHEMA);
+    grantPermissions(
+        READWRITE_EMAIL,
+        SecurableType.VOLUME,
+        volume.getFullName(),
+        Privileges.READ_VOLUME,
+        Privileges.WRITE_VOLUME);
+    testVolumeCredentials(api, volume, true, true);
+
+    for (Privileges missing :
+        List.of(
+            Privileges.USE_CATALOG,
+            Privileges.USE_SCHEMA,
+            Privileges.READ_VOLUME,
+            Privileges.WRITE_VOLUME)) {
+      SecurableType type =
+          switch (missing) {
+            case USE_CATALOG -> SecurableType.CATALOG;
+            case USE_SCHEMA -> SecurableType.SCHEMA;
+            default -> SecurableType.VOLUME;
+          };
+      String name =
+          switch (type) {
+            case CATALOG -> CATALOG_NAME;
+            case SCHEMA -> schemaFullName;
+            default -> volume.getFullName();
+          };
+      revokePermissions(READWRITE_EMAIL, type, name, Privilege.fromValue(missing.getValue()));
+      testVolumeCredentials(api, volume, missing == Privileges.WRITE_VOLUME, false);
+      grantPermissions(READWRITE_EMAIL, type, name, missing);
+    }
+    testVolumeCredentials(api, volume, true, true);
+  }
+
+  @ParameterizedTest
+  @EnumSource(
+      value = SecurableType.class,
+      names = {"CATALOG", "SCHEMA"})
+  @SneakyThrows
+  public void testVolumeWriteInheritanceAndRevocation(SecurableType type) {
+    VolumeInfo existing = createExternalVolume(TEST_EXTERNAL_LOCATION_URL + "/existing");
+    TemporaryCredentialsApi api = createTempCredApiForNewUser(READWRITE_EMAIL, List.of());
+    grantPermissions(READWRITE_EMAIL, SecurableType.CATALOG, CATALOG_NAME, Privileges.USE_CATALOG);
+    grantPermissions(
+        READWRITE_EMAIL, SecurableType.SCHEMA, SCHEMA_FULL_NAME, Privileges.USE_SCHEMA);
+    String name = type == SecurableType.CATALOG ? CATALOG_NAME : SCHEMA_FULL_NAME;
+    grantPermissions(READWRITE_EMAIL, type, name, Privileges.READ_VOLUME, Privileges.WRITE_VOLUME);
+    VolumeInfo future =
+        createExternalVolume("future_volume", TEST_EXTERNAL_LOCATION_URL + "/future");
+    for (VolumeInfo volume : List.of(existing, future)) {
+      testVolumeCredentials(api, volume, true, true);
+    }
+
+    grantPermissions(
+        READWRITE_EMAIL, SecurableType.VOLUME, existing.getFullName(), Privileges.WRITE_VOLUME);
+    revokePermissions(READWRITE_EMAIL, type, name, Privilege.WRITE_VOLUME);
+    testVolumeCredentials(api, existing, true, true);
+    testVolumeCredentials(api, future, true, false);
+
+    revokePermissions(
+        READWRITE_EMAIL, SecurableType.VOLUME, existing.getFullName(), Privilege.WRITE_VOLUME);
+    testVolumeCredentials(api, existing, true, false);
+    grantPermissions(READWRITE_EMAIL, type, name, Privileges.WRITE_VOLUME);
+    grantPermissions(
+        READWRITE_EMAIL, SecurableType.VOLUME, existing.getFullName(), Privileges.WRITE_VOLUME);
+    revokePermissions(
+        READWRITE_EMAIL, SecurableType.VOLUME, existing.getFullName(), Privilege.WRITE_VOLUME);
+    testVolumeCredentials(api, existing, true, true);
+
+    revokePermissions(READWRITE_EMAIL, type, name, Privilege.READ_VOLUME);
+    for (VolumeInfo volume : List.of(existing, future)) {
+      testVolumeCredentials(api, volume, false, false);
+    }
+  }
+
+  @Test
+  @SneakyThrows
+  public void testVolumeWriteOwnerScopes() {
+    createCommonTestUsers();
+    setupCommonCatalogAndSchema();
+    String catalog = "cat_pr1";
+    String schema = catalog + ".sch_pr2";
+    grantPermissions(
+        PRINCIPAL_2,
+        SecurableType.CATALOG,
+        catalog,
+        Privileges.USE_CATALOG,
+        Privileges.CREATE_SCHEMA);
+    new SchemasApi(TestUtils.createApiClient(createTestUserServerConfig(PRINCIPAL_2)))
+        .createSchema(new CreateSchema().catalogName(catalog).name("sch_pr2"));
+    grantPermissions(
+        TABLE_VOLUME_OWNER_EMAIL, SecurableType.CATALOG, catalog, Privileges.USE_CATALOG);
+    grantPermissions(
+        TABLE_VOLUME_OWNER_EMAIL,
+        SecurableType.SCHEMA,
+        schema,
+        Privileges.USE_SCHEMA,
+        Privileges.CREATE_VOLUME);
+    VolumeInfo volume =
+        new VolumesApi(tableVolumeCreatorApiClient)
+            .createVolume(
+                new CreateVolumeRequestContent()
+                    .name("volume")
+                    .catalogName(catalog)
+                    .schemaName("sch_pr2")
+                    .volumeType(VolumeType.EXTERNAL)
+                    .storageLocation(TEST_EXTERNAL_LOCATION_URL + "/owner_volume"));
+    revokePermissions(PRINCIPAL_1, SecurableType.CATALOG, catalog, Privilege.USE_CATALOG);
+    revokePermissions(PRINCIPAL_2, SecurableType.CATALOG, catalog, Privilege.USE_CATALOG);
+    revokePermissions(
+        TABLE_VOLUME_OWNER_EMAIL, SecurableType.CATALOG, catalog, Privilege.USE_CATALOG);
+    revokePermissions(TABLE_VOLUME_OWNER_EMAIL, SecurableType.SCHEMA, schema, Privilege.USE_SCHEMA);
+
+    for (String principal : List.of("admin", PRINCIPAL_1, PRINCIPAL_2, TABLE_VOLUME_OWNER_EMAIL)) {
+      TemporaryCredentialsApi api =
+          principal.equals("admin")
+              ? adminTempCredsApi
+              : new TemporaryCredentialsApi(
+                  TestUtils.createApiClient(createTestUserServerConfig(principal)));
+      testVolumeCredentials(api, volume, false, false);
+      if (!principal.equals(PRINCIPAL_1)) {
+        grantPermissions(principal, SecurableType.CATALOG, catalog, Privileges.USE_CATALOG);
+      }
+      if (!principal.equals(PRINCIPAL_2)) {
+        grantPermissions(principal, SecurableType.SCHEMA, schema, Privileges.USE_SCHEMA);
+      }
+      boolean ownsVolume = principal.equals(TABLE_VOLUME_OWNER_EMAIL);
+      testVolumeCredentials(api, volume, ownsVolume, ownsVolume);
+      if (!ownsVolume) {
+        grantPermissions(
+            principal,
+            SecurableType.VOLUME,
+            volume.getFullName(),
+            Privileges.READ_VOLUME,
+            Privileges.WRITE_VOLUME);
+        testVolumeCredentials(api, volume, true, true);
+      }
+      if (!principal.equals(PRINCIPAL_1)) {
+        revokePermissions(principal, SecurableType.CATALOG, catalog, Privilege.USE_CATALOG);
+        testVolumeCredentials(api, volume, false, false);
+        grantPermissions(principal, SecurableType.CATALOG, catalog, Privileges.USE_CATALOG);
+      }
+      if (!principal.equals(PRINCIPAL_2)) {
+        revokePermissions(principal, SecurableType.SCHEMA, schema, Privilege.USE_SCHEMA);
+        testVolumeCredentials(api, volume, false, false);
+      }
+    }
+  }
+
+  @SneakyThrows
+  private void testVolumeCredentials(
+      TemporaryCredentialsApi api, VolumeInfo volume, boolean canRead, boolean canWrite) {
+    for (boolean write : new boolean[] {false, true}) {
+      for (boolean path : new boolean[] {false, true}) {
+        String url = volume.getStorageLocation() + (path ? "/subdir/file" : "");
+        Callable<TemporaryCredentials> request =
+            path
+                ? () ->
+                    api.generateTemporaryPathCredentials(
+                        new GenerateTemporaryPathCredential()
+                            .url(url)
+                            .operation(write ? PATH_READ_WRITE : PATH_READ))
+                : () ->
+                    api.generateTemporaryVolumeCredentials(
+                        new GenerateTemporaryVolumeCredential()
+                            .volumeId(volume.getVolumeId())
+                            .operation(
+                                write
+                                    ? VolumeOperation.WRITE_VOLUME
+                                    : VolumeOperation.READ_VOLUME));
+        clearInvocations(mockCloudCredentialVendor);
+        if (write ? canWrite : canRead) {
+          TemporaryCredentials credentials = request.call();
+          assertValidTemporaryCredentials(credentials);
+          assertThat(credentials.getUrl()).isEqualTo(url);
+          ArgumentCaptor<CredentialContext> context =
+              ArgumentCaptor.forClass(CredentialContext.class);
+          verify(mockCloudCredentialVendor).vendCredential(context.capture());
+          assertThat(context.getValue().getLocations()).containsExactly(NormalizedURL.from(url));
+          assertThat(context.getValue().getPrivileges())
+              .isEqualTo(
+                  write
+                      ? Set.of(
+                          CredentialContext.Privilege.SELECT, CredentialContext.Privilege.UPDATE)
+                      : Set.of(CredentialContext.Privilege.SELECT));
+        } else {
+          assertPermissionDenied(request::call);
+          verify(mockCloudCredentialVendor, never()).vendCredential(any());
+        }
+      }
+    }
+  }
+
+  @SneakyThrows
+  private void revokePermissions(
+      String principal, SecurableType type, String name, Privilege... privileges) {
+    grantsApi.update(
+        type,
+        name,
+        new UpdatePermissions()
+            .changes(
+                List.of(new PermissionsChange().principal(principal).remove(List.of(privileges)))));
+  }
+
+  @Test
+  public void testPendingCleanupBlocksPathAuthorization() {
+    String cleanupPath = TEST_EXTERNAL_LOCATION_URL + "/deleted";
+    UUID resourceId = UUID.randomUUID();
+    TransactionManager.executeWithTransaction(
+        hibernateConfigurator.getSessionFactory(),
+        session -> {
+          new StorageCleanupTaskRepository(hibernateConfigurator.getSessionFactory())
+              .create(session, ManagedResourceType.TABLE, resourceId, "orders", cleanupPath);
+          return null;
+        },
+        "Failed to create test cleanup task",
+        /* readOnly= */ false);
+    clearInvocations(mockCloudCredentialVendor);
+
+    for (String path : List.of(TEST_EXTERNAL_LOCATION_URL, cleanupPath, cleanupPath + "/data")) {
+      for (TemporaryCredentialsApi api : List.of(adminTempCredsApi, locationOwnerTempCredsApi)) {
+        for (PathOperation operation : List.of(PATH_READ, PATH_READ_WRITE, PATH_CREATE_TABLE)) {
+          TestUtils.assertApiException(
+              () ->
+                  api.generateTemporaryPathCredentials(
+                      new GenerateTemporaryPathCredential().url(path).operation(operation)),
+              ErrorCode.PERMISSION_DENIED,
+              "Input path overlaps pending storage cleanup");
+        }
+      }
+    }
+    verify(mockCloudCredentialVendor, never()).vendCredential(any());
+    TestUtils.assertApiException(
+        () -> createExternalTable(cleanupPath + "/table"),
+        ErrorCode.PERMISSION_DENIED,
+        "Input path overlaps pending storage cleanup");
+    TestUtils.assertApiException(
+        () -> createExternalVolume(TEST_EXTERNAL_LOCATION_URL),
+        ErrorCode.PERMISSION_DENIED,
+        "Input path overlaps pending storage cleanup");
+
+    testPathCredentialsSuccess(
+        locationOwnerTempCredsApi, TEST_EXTERNAL_LOCATION_URL + "/active", PATH_READ_WRITE);
+
+    TransactionManager.executeWithTransaction(
+        hibernateConfigurator.getSessionFactory(),
+        session -> {
+          session.remove(session.get(StorageCleanupTaskDAO.class, resourceId));
+          return null;
+        },
+        "Failed to remove test cleanup task",
+        /* readOnly= */ false);
+    testPathCredentialsSuccess(locationOwnerTempCredsApi, cleanupPath, PATH_READ_WRITE);
+    createExternalTable(cleanupPath + "/table");
+    createExternalVolume(cleanupPath + "/volume");
+  }
+
+  private void testPathCredentials(List<String> urls, List<TestCase> testCases) {
+    List<PathOperation> subTestCases = List.of(PATH_READ, PATH_READ_WRITE, PATH_CREATE_TABLE);
+    for (String url : urls) {
+      for (TestCase testCase : testCases) {
+        for (PathOperation operation : subTestCases) {
+          boolean expectSuccess = testCase.getExpectOperations().contains(operation);
+          if (expectSuccess) {
+            testPathCredentialsSuccess(testCase.api, url, operation);
+          } else {
+            testPermissionDenied(testCase.api, url, operation);
+          }
+        }
+      }
+    }
+  }
+
+  @SneakyThrows
+  private void testPathCredentialsSuccess(
+      TemporaryCredentialsApi api, String url, PathOperation operation) {
+    GenerateTemporaryPathCredential request =
+        new GenerateTemporaryPathCredential().url(url).operation(operation);
+    TemporaryCredentials creds = api.generateTemporaryPathCredentials(request);
+    assertThat(creds).isNotNull();
+    assertValidTemporaryCredentials(creds);
+  }
+
+  private void testPermissionDenied(
+      TemporaryCredentialsApi api, String url, PathOperation operation) {
+    GenerateTemporaryPathCredential request =
+        new GenerateTemporaryPathCredential().url(url).operation(operation);
+    assertPermissionDenied(() -> api.generateTemporaryPathCredentials(request));
+  }
+
+  private void assertValidTemporaryCredentials(TemporaryCredentials credentials) {
+    assertThat(credentials).isNotNull();
+    assertThat(credentials.getAwsTempCredentials()).isNotNull();
+
+    AwsCredentials awsCreds = credentials.getAwsTempCredentials();
+    assertThat(awsCreds.getAccessKeyId()).isNotNull().isNotEmpty();
+    assertThat(awsCreds.getSecretAccessKey()).isNotNull().isNotEmpty();
+    assertThat(awsCreds.getSessionToken()).isNotNull().isNotEmpty();
+
+    // Expiration time should be set
+    assertThat(credentials.getExpirationTime()).isNotNull();
+  }
+
+  @SneakyThrows
+  private void createExternalTable(String storageLocation) {
+    CreateTable createTableRequest =
+        new CreateTable()
+            .name(TestUtils.TABLE_NAME)
+            .catalogName(TestUtils.CATALOG_NAME)
+            .schemaName(TestUtils.SCHEMA_NAME)
+            .columns(
+                List.of(
+                    new ColumnInfo()
+                        .name("id")
+                        .typeText("INTEGER")
+                        .typeJson(
+                            "{\"name\":\"id\",\"type\":\"integer\","
+                                + "\"nullable\":false,\"metadata\":{}}")
+                        .typeName(ColumnTypeName.INT)
+                        .position(0)
+                        .nullable(false)))
+            .tableType(TableType.EXTERNAL)
+            .storageLocation(storageLocation)
+            .dataSourceFormat(DataSourceFormat.DELTA);
+    TableInfo tableInfo =
+        new TablesApi(tableVolumeCreatorApiClient).createTable(createTableRequest);
+    assertThat(tableInfo).isNotNull();
+  }
+
+  @SneakyThrows
+  private VolumeInfo createExternalVolume(String storageLocation) {
+    return createExternalVolume(TestUtils.VOLUME_NAME, storageLocation);
+  }
+
+  @SneakyThrows
+  private VolumeInfo createExternalVolume(String name, String storageLocation) {
+    CreateVolumeRequestContent createVolumeRequest =
+        new CreateVolumeRequestContent()
+            .name(name)
+            .catalogName(TestUtils.CATALOG_NAME)
+            .schemaName(TestUtils.SCHEMA_NAME)
+            .volumeType(VolumeType.EXTERNAL)
+            .storageLocation(storageLocation);
+    VolumeInfo volumeInfo =
+        new VolumesApi(tableVolumeCreatorApiClient).createVolume(createVolumeRequest);
+    assertThat(volumeInfo).isNotNull();
+    return volumeInfo;
+  }
+
+  public static class TestAwsAwsCredentialGenerator implements AwsCredentialGenerator {
+    @Override
+    public Credentials generate(CredentialContext ctx) {
+      return Credentials.builder()
+          .accessKeyId("test-access-key-id")
+          .secretAccessKey("test-secret-access-key")
+          .sessionToken("test-session-token")
+          .expiration(Instant.now().plusSeconds(3600))
+          .build();
+    }
+  }
+}

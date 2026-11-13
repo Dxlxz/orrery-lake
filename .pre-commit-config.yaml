@@ -1,0 +1,35 @@
+fail_fast: true
+
+exclude: |
+  (?x)(
+      ^.venv/
+      ^venv/
+  )
+
+repos:
+  # Markdown formatter
+  - repo: https://github.com/executablebooks/mdformat
+    rev: 0.7.18
+    hooks:
+      - id: mdformat
+        args: [ --number ]
+        exclude: ".github|api|CODE_OF_CONDUCT.md|helm"
+        require_serial: true
+        additional_dependencies:
+          - mdformat_frontmatter
+  - repo: https://github.com/norwoodj/helm-docs
+    rev: v1.14.2
+    hooks:
+      - id: helm-docs
+        files: ^helm/
+        args:
+          - --chart-search-root=helm
+          - --output-file=README.md
+  - repo: local
+    hooks:
+      - id: clean-bun-lock
+        name: Strip proxy URLs from ui/bun.lock
+        language: system
+        entry: bash -c 'cd ui && bun run clean-bun-lock'
+        files: ^ui/bun\.lock$
+        pass_filenames: false

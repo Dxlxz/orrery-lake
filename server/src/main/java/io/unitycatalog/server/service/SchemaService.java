@@ -1,0 +1,148 @@
+package io.unitycatalog.server.service;
+
+import static io.unitycatalog.server.model.SecurableType.CATALOG;
+import static io.unitycatalog.server.model.SecurableType.EXTERNAL_LOCATION;
+import static io.unitycatalog.server.model.SecurableType.METASTORE;
+import static io.unitycatalog.server.model.SecurableType.SCHEMA;
+
+import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.server.annotation.Delete;
+import com.linecorp.armeria.server.annotation.Get;
+import com.linecorp.armeria.server.annotation.Param;
+import com.linecorp.armeria.server.annotation.Patch;
+import com.linecorp.armeria.server.annotation.Post;
+import io.unitycatalog.server.auth.AuthorizeExpressions;
+import io.unitycatalog.server.auth.UnityCatalogAuthorizer;
+import io.unitycatalog.server.auth.annotation.AuthorizeExpression;
+import io.unitycatalog.server.auth.annotation.AuthorizeKey;
+import io.unitycatalog.server.auth.annotation.AuthorizeResourceKey;
+import io.unitycatalog.server.auth.annotation.AuthorizeResourceKeys;
+import io.unitycatalog.server.auth.annotation.ResponseAuthorizeFilter;
+import io.unitycatalog.server.auth.decorator.BrowseOnlyConverter;
+import io.unitycatalog.server.model.CatalogInfo;
+import io.unitycatalog.server.model.CreateSchema;
+import io.unitycatalog.server.model.ListSchemasResponse;
+import io.unitycatalog.server.model.SchemaInfo;
+import io.unitycatalog.server.model.SecurableType;
+import io.unitycatalog.server.model.UpdateSchema;
+import io.unitycatalog.server.persist.CatalogRepository;
+import io.unitycatalog.server.persist.MetastoreRepository;
+import io.unitycatalog.server.persist.Repositories;
+import io.unitycatalog.server.persist.SchemaRepository;
+import io.unitycatalog.server.persist.model.DeletedResource;
+import io.unitycatalog.server.utils.ServerProperties;
+import java.util.List;
+import java.util.Optional;
+import lombok.SneakyThrows;
+
+public class SchemaService extends AuthorizedService implements UnityCatalogRestService {
+  private final SchemaRepository schemaRepository;
+  private final CatalogRepository catalogRepository;
+  private final MetastoreRepository metastoreRepository;
+
+  @SneakyThrows
+  public SchemaService(
+      UnityCatalogAuthorizer authorizer,
+      Repositories repositories,
+      ServerProperties serverProperties) {
+    super(authorizer, repositories, serverProperties);
+    this.schemaRepository = repositories.getSchemaRepository();
+    this.catalogRepository = repositories.getCatalogRepository();
+    this.metastoreRepository = repositories.getMetastoreRepository();
+  }
+
+  /**
+   * Creating a schema requires OWNER or USE_CATALOG+CREATE_SCHEMA permission on parent catalog.
+   * Additionally, if a {@code storage_root} is specified:
+   *
+   * <ul>
+   *   <li>The path has to map to an external_location, not anything else (tables, volumes, models),
+   *       to make sure the path isn't under any existing data securables.
+   *   <li>User needs to have OWNER or CREATE_MANAGED_STORAGE permission on the external location.
+   * </ul>
+   *
+   * {@code storage_root} is annotated as both a {@link AuthorizeResourceKey} (which maps to owning
+   * resource) and {@link AuthorizeKey} (which is simply the raw value of storage_root). This is
+   * done so that the expression can check both: 1. if parameter is specified, and 2. which external
+   * location (rather than tables etc.) owns the path.
+   */
+  @Post("")
+  @AuthorizeExpression(AuthorizeExpressions.CREATE_SCHEMA_WITH_STORAGE_ROOT)
+  @AuthorizeResourceKey(METASTORE)
+  public HttpResponse createSchema(
+      @AuthorizeResourceKeys({
+            @AuthorizeResourceKey(value = CATALOG, key = "catalog_name"),
+            @AuthorizeResourceKey(value = EXTERNAL_LOCATION, key = "storage_root")
+          })
+          @AuthorizeKey(key = "storage_root")
+          CreateSchema createSchema) {
+    SchemaInfo schemaInfo = schemaRepository.createSchema(createSchema);
+
+    CatalogInfo catalogInfo = catalogRepository.getCatalog(schemaInfo.getCatalogName());
+    initializeHierarchicalAuthorization(schemaInfo.getSchemaId(), catalogInfo.getId());
+
+    return HttpResponse.ofJson(schemaInfo);
+  }
+
+  @Get("")
+  @AuthorizeExpression(AuthorizeExpressions.GET_SCHEMA)
+  @ResponseAuthorizeFilter(browse = AuthorizeExpressions.BROWSE_CATALOG)
+  @AuthorizeResourceKey(METASTORE)
+  public HttpResponse listSchemas(
+      @Param("catalog_name") @AuthorizeResourceKey(CATALOG) String catalogName,
+      @Param("max_results") Optional<Integer> maxResults,
+      @Param("page_token") Optional<String> pageToken,
+      @Param("include_browse") Optional<Boolean> includeBrowse) {
+    ListSchemasResponse listSchemasResponse =
+        schemaRepository.listSchemas(catalogName, maxResults, pageToken);
+    applyResponseFilter(
+        SecurableType.SCHEMA, listSchemasResponse.getSchemas(), BrowseOnlyConverter::toBrowseOnly);
+    return HttpResponse.ofJson(listSchemasResponse);
+  }
+
+  @Get("/{full_name}")
+  @AuthorizeExpression(AuthorizeExpressions.GET_SCHEMA)
+  @ResponseAuthorizeFilter(isList = false, browse = AuthorizeExpressions.BROWSE_CATALOG)
+  @AuthorizeResourceKey(METASTORE)
+  public HttpResponse getSchema(
+      @Param("full_name") @AuthorizeResourceKey(SCHEMA) String fullName,
+      @Param("include_browse") Optional<Boolean> includeBrowse) {
+    return HttpResponse.ofJson(
+        applyGetResponseFilter(
+            SecurableType.SCHEMA,
+            schemaRepository.getSchema(fullName),
+            BrowseOnlyConverter::toBrowseOnly));
+  }
+
+  @Patch("/{full_name}")
+  @AuthorizeExpression(
+      "("
+          + AuthorizeExpressions.UPDATE_SCHEMA
+          + """
+          ) &&
+          (#new_name == null ||
+            (#authorize(#principal, #catalog, USE_CATALOG) &&
+              #authorize(#principal, #schema, OWNER)) || (
+          """
+          + AuthorizeExpressions.CREATE_SCHEMA
+          + "))")
+  @AuthorizeResourceKey(METASTORE)
+  public HttpResponse updateSchema(
+      @Param("full_name") @AuthorizeResourceKey(SCHEMA) String fullName,
+      @AuthorizeKey(key = "new_name") UpdateSchema updateSchema) {
+    return HttpResponse.ofJson(schemaRepository.updateSchema(fullName, updateSchema));
+  }
+
+  @Delete("/{full_name}")
+  @AuthorizeExpression(AuthorizeExpressions.DELETE_SCHEMA)
+  @AuthorizeResourceKey(METASTORE)
+  public HttpResponse deleteSchema(
+      @Param("full_name") @AuthorizeResourceKey(SCHEMA) String fullName,
+      @Param("force") Optional<Boolean> force) {
+    schemaRepository.getSchema(fullName);
+    List<DeletedResource> deleted = schemaRepository.deleteSchema(fullName, force.orElse(false));
+    clearDeletedResourceAuthorizations(deleted);
+    return HttpResponse.of(HttpStatus.OK);
+  }
+}

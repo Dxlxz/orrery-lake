@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package uc.v1;
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+// Generic passthrough for the control-plane auth, SCIM, and read-only
+// permissions endpoints that do not yet have typed UI services.
+message CallRequest {
+  // Deprecated. The bridge only uses its configured UC_SERVER and rejects
+  // non-empty values.
+  string server_url = 1 [deprecated = true];
+  // Optional bearer token. When empty, cookie-based auth is used (forwarded by
+  // the bridge from the browser's request).
+  string token = 2;
+  // HTTP method: GET | POST | PATCH | PUT | DELETE.
+  string method = 3;
+  // Allowlisted request path, e.g. /api/1.0/unity-control/scim2/Me.
+  string path = 4;
+  repeated KeyValue query = 5;
+  // Raw request body (ignored for GET/DELETE without a body). Usually JSON, but
+  // the OAuth token endpoint sends url-encoded form data; see content_type.
+  string json_body = 6;
+  // Content-Type for the request body. Defaults to application/json when empty.
+  // The OAuth token-exchange endpoint requires application/x-www-form-urlencoded.
+  string content_type = 7;
+}
+
+message CallResponse {
+  int32 http_status = 1;
+  // Response body verbatim (JSON or text).
+  string body = 2;
+  bool ok = 3;
+}
+
+service UnityProxyService {
+  rpc Call(CallRequest) returns (CallResponse);
+}

@@ -1,0 +1,1030 @@
+package io.unitycatalog.server.utils;
+
+import com.linecorp.armeria.client.Endpoint;
+import io.unitycatalog.server.exception.BaseException;
+import io.unitycatalog.server.exception.ErrorCode;
+import io.unitycatalog.server.model.TableType;
+import io.unitycatalog.server.service.credential.aws.S3StorageConfig;
+import io.unitycatalog.server.service.credential.azure.ADLSStorageConfig;
+import io.unitycatalog.server.service.credential.gcp.GcsStorageConfig;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.MalformedURLException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Duration;
+import java.time.format.DateTimeParseException;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.IntPredicate;
+import java.util.regex.Pattern;
+import lombok.Getter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class ServerProperties {
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(ServerProperties.class);
+
+  // Any key can also be set in the environment variable named by envName(key), such as
+  // UC_SERVER_CLIENT_SECRET or UC_S3_SECRETKEY_0. The prefix keeps variables that runtimes set for
+  // their own use, such as AWS_REGION, from changing settings.
+  private static final String ENV_PREFIX = "UC_";
+
+  /**
+   * Key of the database password in hibernate.properties; the environment variable named by {@link
+   * #envName} overrides it.
+   */
+  public static final String DB_PASSWORD_KEY = "hibernate.connection.password";
+
+  // Secrets, which log a deprecation warning when they are read from server.properties.
+  private static final Pattern SECRET_KEY =
+      Pattern.compile(
+          "server\\.client-secret|aws\\.secretKey"
+              + "|(s3\\.secretKey|s3\\.sessionToken|adls\\.clientSecret)\\.\\d+");
+
+  private final Properties properties = new Properties(generateDefaults());
+  private final Map<String, String> env;
+  private final Set<String> keysFromEnv = ConcurrentHashMap.newKeySet();
+
+  /** Validator interface for property values */
+  private interface PropertyValidator {
+    /**
+     * Validates a property value
+     *
+     * @param key the property key
+     * @param value the property value to validate
+     * @throws BaseException if validation fails
+     */
+    void validate(String key, String value);
+  }
+
+  /** Validator for enum-like properties with a fixed set of allowed values */
+  private static class EnumValidator implements PropertyValidator {
+    private final Set<String> allowedValues;
+    private final boolean caseInsensitive;
+
+    EnumValidator(boolean caseInsensitive, String... allowedValues) {
+      this.caseInsensitive = caseInsensitive;
+      this.allowedValues = new HashSet<>();
+      for (String value : allowedValues) {
+        this.allowedValues.add(caseInsensitive ? value.toLowerCase() : value);
+      }
+    }
+
+    @Override
+    public void validate(String key, String value) {
+      String checkValue = caseInsensitive ? value.toLowerCase() : value;
+      if (!allowedValues.contains(checkValue)) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            String.format(
+                "Invalid value '%s' for property '%s'. Allowed values: %s",
+                value, key, allowedValues));
+      }
+    }
+  }
+
+  /** Validator for boolean properties */
+  private static class BooleanValidator extends EnumValidator {
+    BooleanValidator() {
+      super(/* caseInsensitive= */ true, "true", "false");
+    }
+  }
+
+  /** Validator for URL properties */
+  private static class UrlValidator implements PropertyValidator {
+    @Override
+    public void validate(String key, String value) {
+      try {
+        new URL(value).toURI();
+      } catch (MalformedURLException | URISyntaxException | IllegalArgumentException e) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            String.format("Invalid URL '%s' for property '%s': %s", value, key, e.getMessage()));
+      }
+    }
+  }
+
+  /** Validator for OPA decision URLs that does not expose their values in errors. */
+  private static class OpaDecisionUrlValidator implements PropertyValidator {
+    @Override
+    public void validate(String key, String value) {
+      String invalidUrlMessage =
+          key + " must be an absolute HTTP or HTTPS URL without credentials or a fragment";
+      try {
+        URL url = new URL(value);
+        url.toURI();
+        if (!("http".equalsIgnoreCase(url.getProtocol())
+                || "https".equalsIgnoreCase(url.getProtocol()))
+            || url.getHost().isEmpty()
+            || url.getUserInfo() != null
+            || url.getRef() != null
+            || url.getPort() == 0
+            || url.getPort() > 65535) {
+          throw new BaseException(ErrorCode.INVALID_ARGUMENT, invalidUrlMessage);
+        }
+        Endpoint.parse(url.getAuthority());
+      } catch (MalformedURLException | URISyntaxException | IllegalArgumentException e) {
+        // Parser errors can contain credentials from the URL.
+        throw new BaseException(ErrorCode.INVALID_ARGUMENT, invalidUrlMessage);
+      }
+    }
+  }
+
+  /**
+   * Validator for storage path properties that can be either URLs or file paths. This is more
+   * lenient than UrlValidator as it accepts both proper URLs (e.g., file:///tmp/path) and plain
+   * file paths (e.g., /tmp/path).
+   */
+  private static class StoragePathValidator implements PropertyValidator {
+    @Override
+    public void validate(String key, String value) {
+      try {
+        NormalizedURL.from(value);
+      } catch (Exception e) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            String.format(
+                "Invalid storage path '%s' for property '%s': %s", value, key, e.getMessage()));
+      }
+    }
+  }
+
+  /** Validator for a comma-separated list of local paths: plain paths or file: URLs. */
+  private static class LocalPathListValidator implements PropertyValidator {
+    @Override
+    public void validate(String key, String value) {
+      for (String entry : splitCommaSeparated(value)) {
+        try {
+          toLocalRoot(entry);
+        } catch (Exception e) {
+          throw new BaseException(
+              ErrorCode.INVALID_ARGUMENT,
+              String.format(
+                  "Invalid local path '%s' for property '%s': %s", entry, key, e.getMessage()));
+        }
+      }
+    }
+  }
+
+  /** Validator for integer properties with a custom condition */
+  private static class IntegerValidator implements PropertyValidator {
+    private final IntPredicate condition;
+    private final String conditionDescription;
+
+    /**
+     * Creates an IntegerValidator with a custom condition.
+     *
+     * @param condition the condition that the integer value must satisfy
+     * @param conditionDescription human-readable description of the condition for error messages
+     */
+    IntegerValidator(IntPredicate condition, String conditionDescription) {
+      this.condition = condition;
+      this.conditionDescription = conditionDescription;
+    }
+
+    @Override
+    public void validate(String key, String value) {
+      try {
+        int intValue = Integer.parseInt(value);
+        if (!condition.test(intValue)) {
+          throw new BaseException(
+              ErrorCode.INVALID_ARGUMENT,
+              String.format(
+                  "Invalid value '%s' for property '%s'. Expected %s",
+                  value, key, conditionDescription));
+        }
+      } catch (NumberFormatException e) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            String.format("Invalid value '%s' for property '%s'. Expected an integer", value, key));
+      }
+    }
+  }
+
+  /** Validator for positive integer properties */
+  private static class PositiveIntegerValidator extends IntegerValidator {
+    PositiveIntegerValidator() {
+      super(i -> i > 0, "a positive integer (> 0)");
+    }
+  }
+
+  /**
+   * Validator for the string format of {@code java.time.Duration}. Check function {@Duration.parse}
+   * for all the accepted forms. Negative durations are rejected; zero is allowed.
+   */
+  private static class DurationValidator implements PropertyValidator {
+    @Override
+    public void validate(String key, String value) {
+      Duration duration;
+      try {
+        duration = Duration.parse(value);
+      } catch (DateTimeParseException e) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            String.format("Invalid value '%s' for property '%s': %s", value, key, e.getMessage()));
+      }
+      if (duration.isNegative()) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            String.format(
+                "Invalid value '%s' for property '%s': must be zero or positive", value, key));
+      }
+    }
+  }
+
+  /** Validator for durations represented by at least one millisecond. */
+  private static class PositiveDurationValidator implements PropertyValidator {
+    @Override
+    public void validate(String key, String value) {
+      try {
+        if (Duration.parse(value).compareTo(Duration.ofMillis(1)) < 0) {
+          throw new BaseException(
+              ErrorCode.INVALID_ARGUMENT,
+              String.format(
+                  "Invalid value '%s' for property '%s'. Expected at least one millisecond",
+                  value, key));
+        }
+      } catch (DateTimeParseException e) {
+        throw new BaseException(
+            ErrorCode.INVALID_ARGUMENT,
+            String.format("Invalid value '%s' for property '%s': %s", value, key, e.getMessage()));
+      }
+    }
+  }
+
+  /** No-op validator that accepts any value */
+  private static class NoOpValidator implements PropertyValidator {
+    @Override
+    public void validate(String key, String value) {
+      // Accept any value
+    }
+  }
+
+  private static final BooleanValidator BOOLEAN_VALIDATOR = new BooleanValidator();
+  private static final UrlValidator URL_VALIDATOR = new UrlValidator();
+  private static final StoragePathValidator STORAGE_PATH_VALIDATOR = new StoragePathValidator();
+  private static final LocalPathListValidator LOCAL_PATH_LIST_VALIDATOR =
+      new LocalPathListValidator();
+  private static final PositiveIntegerValidator POSITIVE_INTEGER_VALIDATOR =
+      new PositiveIntegerValidator();
+  private static final NoOpValidator NOOP_VALIDATOR = new NoOpValidator();
+  private static final DurationValidator DURATION_VALIDATOR = new DurationValidator();
+  private static final PositiveDurationValidator POSITIVE_DURATION_VALIDATOR =
+      new PositiveDurationValidator();
+
+  @Getter
+  public enum Property {
+    SERVER_ENV("server.env", "dev", new EnumValidator(true, "dev", "prod", "test")),
+    AUTHORIZATION_ENABLED(
+        "server.authorization", "disable", new EnumValidator(true, "enable", "disable")),
+    AUTHORIZATION_PROVIDER(
+        "server.authorization.provider", "casbin", new EnumValidator(true, "casbin", "opa")),
+    OPA_DECISION_URL("server.authorization.opa.decision-url", new OpaDecisionUrlValidator()),
+    OPA_RESPONSE_TIMEOUT(
+        "server.authorization.opa.response-timeout", "PT5S", POSITIVE_DURATION_VALIDATOR),
+    STRICT_PRIVILEGE_CHECKS_ENABLED(
+        "server.authorization.strict-privilege-checks", "true", BOOLEAN_VALIDATOR),
+    POLICY_REFRESH_ENABLED("server.authorization.policy-refresh", "false", BOOLEAN_VALIDATOR),
+    POLICY_REFRESH_INTERVAL(
+        "server.authorization.policy-refresh-interval", "PT1M", DURATION_VALIDATOR),
+    POLICY_REFRESH_MIN_PROBE_INTERVAL(
+        "server.authorization.policy-refresh-min-probe-interval", "PT1S", DURATION_VALIDATOR),
+    STORAGE_CLEANUP_POLL_INTERVAL(
+        "server.storage-cleanup.poll-interval", "PT1M", POSITIVE_DURATION_VALIDATOR),
+    STORAGE_CLEANUP_ATTEMPT_TIMEOUT(
+        "server.storage-cleanup.attempt-timeout", "PT30M", POSITIVE_DURATION_VALIDATOR),
+    STORAGE_CLEANUP_LEASE_DURATION(
+        "server.storage-cleanup.lease-duration", "PT2H", POSITIVE_DURATION_VALIDATOR),
+    STORAGE_CLEANUP_INITIAL_DELAY(
+        "server.storage-cleanup.initial-delay", "P7D", POSITIVE_DURATION_VALIDATOR),
+    STORAGE_CLEANUP_RETRY_BACKOFF(
+        "server.storage-cleanup.retry-backoff", "PT1H", POSITIVE_DURATION_VALIDATOR),
+    STORAGE_CREDENTIAL_CACHE_ENABLED(
+        "server.storage-credential-cache.enabled", "false", BOOLEAN_VALIDATOR),
+    STORAGE_CREDENTIAL_CACHE_MAX_SIZE(
+        "server.storage-credential-cache.max-size", "1000", POSITIVE_INTEGER_VALIDATOR),
+    STORAGE_CREDENTIAL_CACHE_MAX_AGE(
+        "server.storage-credential-cache.max-age", "PT5M", POSITIVE_DURATION_VALIDATOR),
+    AUDIT_SINK("server.audit.sink"),
+    AUTHORIZATION_URL("server.authorization-url", URL_VALIDATOR),
+    TOKEN_URL("server.token-url", URL_VALIDATOR),
+    CLIENT_ID("server.client-id"),
+    CLIENT_SECRET("server.client-secret"),
+    REDIRECT_PORT("server.redirect-port", POSITIVE_INTEGER_VALIDATOR),
+    ALLOWED_ISSUERS("server.allowed-issuers"),
+    ALLOWED_JWKS_URIS("server.allowed-jwks-uris"),
+    AUDIENCES("server.audiences"),
+    COOKIE_TIMEOUT("server.cookie-timeout", "P5D", DURATION_VALIDATOR),
+    ACCESS_TOKEN_TIMEOUT("server.access-token-timeout", "PT24H", DURATION_VALIDATOR),
+    READINESS_PROBE_INTERVAL(
+        "server.readiness.probe-interval", "PT5S", POSITIVE_DURATION_VALIDATOR),
+    READINESS_DB_TIMEOUT("server.readiness.db-timeout", "PT2S", POSITIVE_DURATION_VALIDATOR),
+    // Bounds Armeria's graceful request drain; the blocking-executor drain gets what is left.
+    // Not a total shutdown deadline, so leave headroom under the orchestrator grace period.
+    SHUTDOWN_TIMEOUT("server.shutdown-timeout", "PT5S", POSITIVE_DURATION_VALIDATOR),
+    MANAGED_TABLE_ENABLED("server.managed-table.enabled", "true", BOOLEAN_VALIDATOR),
+    // Enables native Iceberg tables; when disabled, existing ones stay readable.
+    ICEBERG_TABLE_ENABLED("server.iceberg-table.enabled", "true", BOOLEAN_VALIDATOR),
+    // Local roots where external Iceberg tables may be created without an external location.
+    EXTERNAL_LOCAL_ROOTS("server.external-local-roots", LOCAL_PATH_LIST_VALIDATOR),
+    MANAGED_TABLE_USE_DELTA_API_ONLY(
+        "server.managed-table.use-delta-api-only", "false", BOOLEAN_VALIDATOR),
+    UNIFORM_ICEBERG_V2_ALLOW_MISSING_DV(
+        "server.managed-table.uniform-iceberg-v2.allow-missing-dv", "false", BOOLEAN_VALIDATOR),
+    // `storage-root.*` are replaced by managed storage locations of catalog and schema.
+    MODEL_STORAGE_ROOT("storage-root.models", STORAGE_PATH_VALIDATOR), // Deprecated
+    TABLE_STORAGE_ROOT("storage-root.tables", STORAGE_PATH_VALIDATOR), // Deprecated
+    AWS_MASTER_ROLE_ARN("aws.masterRoleArn"),
+    AWS_ACCESS_KEY("aws.accessKey"),
+    AWS_SECRET_KEY("aws.secretKey"),
+    AWS_SESSION_TOKEN("aws.sessionToken"),
+    AWS_REGION("aws.region"),
+    INCLUDE_STACK_TRACE_IN_ERROR("server.include-stacktrace-in-error", "false", BOOLEAN_VALIDATOR);
+    // The is not an exhaustive list. Some property keys like s3.bucketPath.0 with a numbering
+    // suffix is not included. They are only accessed internally from functions like
+    // getS3Configurations.
+
+    private final String key;
+    private final String defaultValue;
+    private final PropertyValidator validator;
+
+    Property(String key, String defaultValue, PropertyValidator validator) {
+      this.key = key;
+      this.defaultValue = defaultValue;
+      this.validator = validator;
+      // Default values are always valid. They are validated by
+      // ServerPropertiesTest.testDefaultPropertyValues
+    }
+
+    Property(String key, PropertyValidator validator) {
+      this(key, null, validator);
+    }
+
+    Property(String key) {
+      this(key, null, NOOP_VALIDATOR);
+    }
+  }
+
+  public ServerProperties() {
+    env = System.getenv();
+    // This call is still useful after the default values being validated by constructors of
+    // Property because it also validates values picked up from system property and env.
+    validateProperties();
+  }
+
+  public ServerProperties(String propertiesFile) {
+    this(propertiesFile, System.getenv());
+  }
+
+  ServerProperties(String propertiesFile, Map<String, String> env) {
+    this.env = env;
+    readPropertiesFromFile(propertiesFile);
+    warnAboutSecretsInFile(propertiesFile);
+    validateProperties();
+  }
+
+  public ServerProperties(Properties inputProperties) {
+    this(inputProperties, System.getenv());
+  }
+
+  ServerProperties(Properties inputProperties, Map<String, String> env) {
+    this.env = env;
+    properties.putAll(inputProperties);
+    validateProperties();
+  }
+
+  /**
+   * Validates all registered properties against their validators. This method is called during
+   * initialization to fail fast if any property has an invalid value. It also validates any
+   * override value from system property and env if set.
+   *
+   * <p>Call this after changing properties and before creating server resources.
+   *
+   * @throws BaseException if any property value is invalid
+   */
+  public void validateProperties() {
+    for (Property property : Property.values()) {
+      String value = get(property);
+      if (value == null) {
+        // null means not set.
+        continue;
+      }
+      property.validator.validate(property.key, value);
+    }
+    validateAuthAllowlistConfiguration();
+    validateStorageCleanupConfiguration();
+    validateOpaConfiguration();
+  }
+
+  private void validateOpaConfiguration() {
+    if (!isOpaAuthorizationEnabled()) {
+      return;
+    }
+    if (!isAuthorizationEnabled()) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "server.authorization=enable is required when server.authorization.provider=opa");
+    }
+    if (getOpaDecisionUrl() == null) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "server.authorization.opa.decision-url is required when"
+              + " server.authorization.provider=opa");
+    }
+  }
+
+  private void validateStorageCleanupConfiguration() {
+    Duration attemptTimeout = getStorageCleanupAttemptTimeout();
+    if (getStorageCleanupLeaseDuration().compareTo(attemptTimeout) <= 0) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "server.storage-cleanup.lease-duration must exceed the attempt timeout");
+    }
+  }
+
+  private void validateAuthAllowlistConfiguration() {
+    List<String> audiences = getAudiences();
+    if (audiences.contains("*") && audiences.size() > 1) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "server.audiences cannot combine '*' with other values; use '*' alone to disable"
+              + " audience validation");
+    }
+
+    List<String> allowedIssuers = getAllowedIssuers();
+    if (allowedIssuers.contains("*")) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "server.allowed-issuers cannot be '*'; use explicit issuers or wildcard patterns such"
+              + " as https://*.dev.example.com");
+    }
+  }
+
+  // Load properties from a configuration file
+  private static Properties generateDefaults() {
+    Properties defaults = new Properties();
+    Arrays.stream(Property.values())
+        .filter(property -> property.defaultValue != null)
+        .forEach(property -> defaults.setProperty(property.key, property.defaultValue));
+    return defaults;
+  }
+
+  // Load properties from a configuration file
+  private void readPropertiesFromFile(String propertiesFile) {
+    Path path = Paths.get(propertiesFile);
+    if (path.toFile().exists()) {
+      try (InputStream input = Files.newInputStream(path)) {
+        properties.load(input);
+        // Remove empty values. In server.properties these lines are for demonstration purpose.
+        properties
+            .entrySet()
+            .removeIf(
+                entry -> entry.getValue() == null || entry.getValue().toString().trim().isEmpty());
+        LOGGER.debug("Server properties loaded successfully: {}", path);
+      } catch (IOException ex) {
+        LOGGER.error("Exception during loading properties", ex);
+      }
+    }
+  }
+
+  private void warnAboutSecretsInFile(String propertiesFile) {
+    for (Object key : properties.keySet()) {
+      String name = key.toString();
+      if (!SECRET_KEY.matcher(name).matches()) {
+        continue;
+      }
+      if (name.equals(Property.CLIENT_SECRET.getKey())) {
+        // Only bin/uc auth login reads it, so a variable in the server's environment does not help.
+        LOGGER.warn(
+            "{} is set in {}. Only bin/uc auth login reads it, and keeping it in this file is"
+                + " deprecated; set the {} environment variable in the shell that runs that command"
+                + " instead.",
+            name,
+            propertiesFile,
+            envName(name));
+      } else if (getOverride(name) == null) {
+        LOGGER.warn(
+            "{} is set in {}. Keeping secrets in this file is deprecated; set the {} environment"
+                + " variable instead.",
+            name,
+            propertiesFile,
+            envName(name));
+      }
+    }
+    // The server never reads the database password from this file. Only the environment
+    // supplies it; a system property does not.
+    if (properties.containsKey(DB_PASSWORD_KEY) && getEnv(DB_PASSWORD_KEY) == null) {
+      LOGGER.warn(
+          "{} in {} is ignored; set the {} environment variable instead.",
+          DB_PASSWORD_KEY,
+          propertiesFile,
+          envName(DB_PASSWORD_KEY));
+    }
+  }
+
+  public S3StorageConfig getS3MasterRoleConfiguration() {
+    // These values may be null and that is OK. An empty config means AWS credential vending will
+    // use the default credential provider which is typically the same when running on AWS cloud.
+    return S3StorageConfig.builder()
+        .region(get(Property.AWS_REGION))
+        .accessKey(get(Property.AWS_ACCESS_KEY))
+        .secretKey(get(Property.AWS_SECRET_KEY))
+        // Does not take AWS_SESSION_TOKEN as it's only part of a temporary credential.
+        .build();
+  }
+
+  public Map<NormalizedURL, S3StorageConfig> getS3Configurations() {
+    Map<NormalizedURL, S3StorageConfig> s3BucketConfigMap = new HashMap<>();
+    int i = 0;
+    while (true) {
+      String bucketPath = getProperty("s3.bucketPath." + i);
+      String region = getProperty("s3.region." + i);
+      String awsRoleArn = getProperty("s3.awsRoleArn." + i);
+      String accessKey = getProperty("s3.accessKey." + i);
+      String secretKey = getProperty("s3.secretKey." + i);
+      String sessionToken = getProperty("s3.sessionToken." + i);
+      String credentialGenerator = getProperty("s3.credentialGenerator." + i);
+      if ((bucketPath == null || region == null || awsRoleArn == null)
+          && (accessKey == null || secretKey == null || sessionToken == null)) {
+        break;
+      }
+      S3StorageConfig s3StorageConfig =
+          S3StorageConfig.builder()
+              .bucketPath(bucketPath)
+              .region(region)
+              .awsRoleArn(awsRoleArn)
+              .accessKey(accessKey)
+              .secretKey(secretKey)
+              .sessionToken(sessionToken)
+              .credentialGenerator(credentialGenerator)
+              .build();
+      s3BucketConfigMap.put(NormalizedURL.from(bucketPath), s3StorageConfig);
+      i++;
+    }
+
+    return s3BucketConfigMap;
+  }
+
+  public Map<NormalizedURL, GcsStorageConfig> getGcsConfigurations() {
+    Map<NormalizedURL, GcsStorageConfig> gcsConfigMap = new HashMap<>();
+    int i = 0;
+    while (true) {
+      String bucketPath = getProperty("gcs.bucketPath." + i);
+      if (bucketPath == null) {
+        break;
+      }
+      String jsonKeyFilePath = getProperty("gcs.jsonKeyFilePath." + i);
+      String credentialGenerator = getProperty("gcs.credentialGenerator." + i);
+      gcsConfigMap.put(
+          NormalizedURL.from(bucketPath),
+          GcsStorageConfig.builder()
+              .bucketPath(bucketPath)
+              .jsonKeyFilePath(jsonKeyFilePath)
+              .credentialGenerator(credentialGenerator)
+              .build());
+      i++;
+    }
+
+    return gcsConfigMap;
+  }
+
+  public Map<String, ADLSStorageConfig> getAdlsConfigurations() {
+    Map<String, ADLSStorageConfig> adlsConfigMap = new HashMap<>();
+
+    int i = 0;
+    while (true) {
+      String storageAccountName = getProperty("adls.storageAccountName." + i);
+      String tenantId = getProperty("adls.tenantId." + i);
+      String clientId = getProperty("adls.clientId." + i);
+      String clientSecret = getProperty("adls.clientSecret." + i);
+      String testMode = getProperty("adls.testMode." + i);
+      String credentialGenerator = getProperty("adls.credentialGenerator." + i);
+      if (storageAccountName == null
+          || tenantId == null
+          || clientId == null
+          || clientSecret == null) {
+        break;
+      }
+      adlsConfigMap.put(
+          storageAccountName,
+          ADLSStorageConfig.builder()
+              .storageAccountName(storageAccountName)
+              .tenantId(tenantId)
+              .clientId(clientId)
+              .clientSecret(clientSecret)
+              .testMode(testMode != null && testMode.equalsIgnoreCase("true"))
+              .credentialGenerator(credentialGenerator)
+              .build());
+      i++;
+    }
+
+    return adlsConfigMap;
+  }
+
+  /**
+   * Get a property value by key.
+   *
+   * <p>The key can be one of the following (in that order) before looking it up in the server
+   * properties:
+   *
+   * <ol>
+   *   <li>System property
+   *   <li>Environment variable with the key as its name, then {@code UC_} plus the key in upper
+   *       case with {@code _} for each character that is not a letter or digit
+   *   <li>server.properties file
+   * </ol>
+   *
+   * <p>If it's not set, the default value is returned.
+   */
+  public String get(Property property) {
+    return getProperty(property.key);
+  }
+
+  /** Get a property value by key name. */
+  private String getProperty(String key) {
+    String override = getOverride(key);
+    if (override != null) {
+      return override;
+    }
+    // Finally try properties. If not found in properties, this would return default value or null
+    // if no default value.
+    return properties.getProperty(key);
+  }
+
+  private String getOverride(String key) {
+    String value = System.getProperty(key);
+    return value != null ? value : getEnv(key);
+  }
+
+  /**
+   * Get a value set for a key in the environment, or null: the variable named exactly as the key,
+   * then the one named by {@link #envName}. System properties are not consulted. Settings kept in
+   * other files, such as the database password in hibernate.properties, use this to let the
+   * environment override the file.
+   */
+  public String getEnv(String key) {
+    String name = key;
+    String value = env.get(key);
+    if (value == null) {
+      name = envName(key);
+      // Trailing line breaks are dropped; a Kubernetes Secret made from a file often ends with one.
+      // An empty variable is treated as unset.
+      value = env.getOrDefault(name, "").replaceAll("[\\r\\n]+$", "");
+      if (value.isEmpty()) {
+        return null;
+      }
+    }
+    // Names only, so an operator can see which environment variables change settings. The server
+    // doesn't use the client secret, so it gets no line.
+    if (!key.equals(Property.CLIENT_SECRET.getKey()) && keysFromEnv.add(key)) {
+      LOGGER.info("Using the {} environment variable for {}", name, key);
+    }
+    return value;
+  }
+
+  /**
+   * The environment variable name for a key: {@code UC_}, then the key in upper case with {@code _}
+   * for each character that is not a letter or digit.
+   */
+  public static String envName(String key) {
+    return ENV_PREFIX + key.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]", "_");
+  }
+
+  public void set(Property property, String value) {
+    // Validate before setting
+    property.validator.validate(property.key, value);
+    properties.setProperty(property.key, value);
+  }
+
+  private boolean isTrueOrEnable(String value) {
+    return value != null && (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("enable"));
+  }
+
+  public boolean isAuthorizationEnabled() {
+    return isTrueOrEnable(get(Property.AUTHORIZATION_ENABLED));
+  }
+
+  /** Whether OPA is selected for privilege decisions. */
+  public boolean isOpaAuthorizationEnabled() {
+    return "opa".equalsIgnoreCase(get(Property.AUTHORIZATION_PROVIDER));
+  }
+
+  /** Returns the configured OPA decision URL, or null when unset. */
+  public String getOpaDecisionUrl() {
+    return get(Property.OPA_DECISION_URL);
+  }
+
+  /** Response timeout for each OPA call, not the complete UC request. */
+  public Duration getOpaResponseTimeout() {
+    return Duration.parse(get(Property.OPA_RESPONSE_TIMEOUT));
+  }
+
+  /** Whether permission checks use the stricter rules instead of the previous rules. */
+  public boolean isStrictPrivilegeChecksEnabled() {
+    return isTrueOrEnable(get(Property.STRICT_PRIVILEGE_CHECKS_ENABLED));
+  }
+
+  /** Whether cross-instance policy refresh is enabled (poll and deny-path reload). */
+  public boolean isPolicyRefreshEnabled() {
+    return isTrueOrEnable(get(Property.POLICY_REFRESH_ENABLED));
+  }
+
+  public Duration getPolicyRefreshInterval() {
+    return Duration.parse(get(Property.POLICY_REFRESH_INTERVAL));
+  }
+
+  public Duration getPolicyRefreshMinProbeInterval() {
+    return Duration.parse(get(Property.POLICY_REFRESH_MIN_PROBE_INTERVAL));
+  }
+
+  public Duration getStorageCleanupPollInterval() {
+    return Duration.parse(get(Property.STORAGE_CLEANUP_POLL_INTERVAL));
+  }
+
+  public Duration getStorageCleanupAttemptTimeout() {
+    return Duration.parse(get(Property.STORAGE_CLEANUP_ATTEMPT_TIMEOUT));
+  }
+
+  public Duration getStorageCleanupLeaseDuration() {
+    return Duration.parse(get(Property.STORAGE_CLEANUP_LEASE_DURATION));
+  }
+
+  public Duration getStorageCleanupInitialDelay() {
+    return Duration.parse(get(Property.STORAGE_CLEANUP_INITIAL_DELAY));
+  }
+
+  public Duration getStorageCleanupRetryBackoff() {
+    return Duration.parse(get(Property.STORAGE_CLEANUP_RETRY_BACKOFF));
+  }
+
+  public boolean isStorageCredentialCacheEnabled() {
+    return Boolean.parseBoolean(get(Property.STORAGE_CREDENTIAL_CACHE_ENABLED));
+  }
+
+  /** The audit sink class name, or null or blank when audit is off. */
+  public String getAuditSink() {
+    return get(Property.AUDIT_SINK);
+  }
+
+  public int getStorageCredentialCacheMaxSize() {
+    return Integer.parseInt(get(Property.STORAGE_CREDENTIAL_CACHE_MAX_SIZE));
+  }
+
+  public Duration getStorageCredentialCacheMaxAge() {
+    return Duration.parse(get(Property.STORAGE_CREDENTIAL_CACHE_MAX_AGE));
+  }
+
+  /** How often the {@code /readyz} background probe re-checks database reachability. */
+  public Duration getReadinessProbeInterval() {
+    return Duration.parse(get(Property.READINESS_PROBE_INTERVAL));
+  }
+
+  /**
+   * Timeout for the {@code /readyz} database reachability check ({@code Connection.isValid}). This
+   * bounds only the validity check, not connection acquisition (see the connection pool's connect
+   * timeout for that).
+   */
+  public Duration getReadinessDbTimeout() {
+    return Duration.parse(get(Property.READINESS_DB_TIMEOUT));
+  }
+
+  /**
+   * Shared shutdown budget: bounds the graceful HTTP drain in stop, and close's blocking-executor
+   * drain gets what is left. Default 5 seconds.
+   */
+  public Duration getShutdownTimeout() {
+    return Duration.parse(get(Property.SHUTDOWN_TIMEOUT));
+  }
+
+  public boolean isIncludeStackTraceInError() {
+    return isTrueOrEnable(get(Property.INCLUDE_STACK_TRACE_IN_ERROR));
+  }
+
+  /** Lifetime of UC access tokens issued by token exchange. Defaults to 24 hours. */
+  public Duration getAccessTokenTimeout() {
+    return Duration.parse(get(Property.ACCESS_TOKEN_TIMEOUT));
+  }
+
+  /**
+   * Cookie max-age for UC access tokens, capped by {@link #getAccessTokenTimeout()} so the cookie
+   * does not outlive the JWT it contains.
+   */
+  public Duration getEffectiveCookieTimeout() {
+    Duration cookieTimeout = Duration.parse(get(Property.COOKIE_TIMEOUT));
+    Duration accessTokenTimeout = getAccessTokenTimeout();
+    return cookieTimeout.compareTo(accessTokenTimeout) > 0 ? accessTokenTimeout : cookieTimeout;
+  }
+
+  /**
+   * Check if experimental MANAGED table feature is enabled. This method throws BaseException with
+   * ErrorCode.INVALID_ARGUMENT if it's disabled.
+   */
+  public void checkManagedTableEnabled() {
+    if (!isTrueOrEnable(get(Property.MANAGED_TABLE_ENABLED))) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "MANAGED table is an is currently disabled. To enable it, set "
+              + "'server.managed-table.enabled=true' in server.properties");
+    }
+  }
+
+  /**
+   * Check if native Iceberg tables are enabled. When disabled, existing native Iceberg tables stay
+   * readable; only namespace/table mutations are rejected by this check.
+   */
+  public void checkIcebergTableEnabled() {
+    if (!isIcebergTableEnabled()) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "Iceberg table writes are currently disabled. To enable them, set "
+              + "'server.iceberg-table.enabled=true' in server.properties");
+    }
+  }
+
+  public boolean isIcebergTableEnabled() {
+    return isTrueOrEnable(get(Property.ICEBERG_TABLE_ENABLED));
+  }
+
+  /**
+   * Reject the UC request when MANAGED_TABLES_USE_DELTA_API_ONLY is on and the targeted table is
+   * MANAGED. Call from UC endpoints whose Delta equivalent should be used instead. Any non-MANAGED
+   * table would continue to work: EXTERNAL, METRIC_VIEW etc.
+   *
+   * @param tableType the table type to check; only {@link TableType#MANAGED} triggers the gate.
+   * @param deltaEndpoint full Delta endpoint to suggest in the error, e.g. {@code "POST
+   *     /delta/v1/catalogs/{catalog}/schemas/{schema}/tables"}.
+   */
+  public void checkDeltaApiOnlyForManagedTable(TableType tableType, String deltaEndpoint) {
+    if (tableType == TableType.MANAGED
+        && isTrueOrEnable(get(Property.MANAGED_TABLE_USE_DELTA_API_ONLY))) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "This Unity Catalog endpoint is disabled for MANAGED Delta tables when "
+              + Property.MANAGED_TABLE_USE_DELTA_API_ONLY.getKey()
+              + "=true. Use the Delta endpoint "
+              + deltaEndpoint
+              + " instead.");
+    }
+  }
+
+  /**
+   * Returns true when the server is configured to allow creation and writing of IcebergCompatV2
+   * tables ({@code delta.enableIcebergCompatV2=true}) without requiring deletion vectors. Set
+   * {@code server.managed-table.uniform-iceberg-v2.allow-missing-dv=true} in server.properties to
+   * enable.
+   */
+  public boolean isUniformIcebergV2AllowMissingDv() {
+    return isTrueOrEnable(get(Property.UNIFORM_ICEBERG_V2_ALLOW_MISSING_DV));
+  }
+
+  /**
+   * Similar to checkDeltaApiOnlyForManagedTable, reject the UC request when
+   * MANAGED_TABLES_USE_DELTA_API_ONLY is on and the target endpoint is for MANAGED tables only. In
+   * this case it doesn't need to check table type. Call from UC endpoints whose Delta equivalent
+   * should be used instead.
+   *
+   * @param deltaEndpoint full Delta endpoint to suggest in the error, e.g. {@code "POST
+   *     /delta/v1/catalogs/{catalog}/schemas/{schema}/staging-tables"}.
+   */
+  public void checkDeltaApiOnlyEnabled(String deltaEndpoint) {
+    if (isTrueOrEnable(get(Property.MANAGED_TABLE_USE_DELTA_API_ONLY))) {
+      throw new BaseException(
+          ErrorCode.INVALID_ARGUMENT,
+          "This Unity Catalog endpoint is disabled when "
+              + Property.MANAGED_TABLE_USE_DELTA_API_ONLY.getKey()
+              + "=true. Use the Delta endpoint "
+              + deltaEndpoint
+              + " instead.");
+    }
+  }
+
+  private volatile WildcardAllowlist cachedIssuerAllowlist;
+  private volatile WildcardAllowlist cachedAudienceAllowlist;
+
+  /**
+   * Returns a compiled allowlist for {@code server.allowed-issuers}, rebuilding when the raw
+   * property value changes.
+   */
+  public WildcardAllowlist getIssuerAllowlist() {
+    String current = getProperty(Property.ALLOWED_ISSUERS.key);
+    String normalized = current == null ? "" : current;
+    WildcardAllowlist cached = cachedIssuerAllowlist;
+    if (cached == null || !cached.source().equals(normalized)) {
+      cached = WildcardAllowlist.forAllowedIssuers(normalized);
+      cachedIssuerAllowlist = cached;
+    }
+    return cached;
+  }
+
+  /**
+   * Returns a compiled allowlist for {@code server.audiences}, rebuilding when the raw property
+   * value changes.
+   */
+  public WildcardAllowlist getAudienceAllowlist() {
+    String current = getProperty(Property.AUDIENCES.key);
+    String normalized = current == null ? "" : current;
+    WildcardAllowlist cached = cachedAudienceAllowlist;
+    if (cached == null || !cached.source().equals(normalized)) {
+      cached = WildcardAllowlist.forAudiences(normalized);
+      cachedAudienceAllowlist = cached;
+    }
+    return cached;
+  }
+
+  /**
+   * Get the list of allowed token issuers.
+   *
+   * <p>When authorization is enabled, tokens will only be accepted from issuers in this list. This
+   * prevents attackers from using their own identity provider to forge tokens.
+   *
+   * @return List of allowed issuer URLs (exact match or wildcard with {@code *})
+   */
+  public List<String> getAllowedIssuers() {
+    return getCommaSeparatedList(Property.ALLOWED_ISSUERS.key);
+  }
+
+  /** Returns exact JWKS URLs allowed in addition to each issuer's own origin. */
+  public List<String> getAllowedJwksUris() {
+    return getCommaSeparatedList(Property.ALLOWED_JWKS_URIS.key);
+  }
+
+  /**
+   * Get the local roots under which external Iceberg tables may be created without an external
+   * location. No securable governs a root, so any principal who can create a table may use it.
+   *
+   * @return the local path of each root; empty (nothing allowed) when unset
+   */
+  public List<Path> getExternalLocalRoots() {
+    return getCommaSeparatedList(Property.EXTERNAL_LOCAL_ROOTS.key).stream()
+        .map(ServerProperties::toLocalRoot)
+        .toList();
+  }
+
+  /**
+   * Returns the local path of a {@code server.external-local-roots} entry.
+   *
+   * @throws IllegalArgumentException if the entry is not a local path, e.g. a cloud URL
+   */
+  private static Path toLocalRoot(String entry) {
+    URI uri = NormalizedURL.from(entry).toUri();
+    if (UriScheme.fromURI(uri) != UriScheme.FILE) {
+      throw new IllegalArgumentException("only local paths are allowed");
+    }
+    return Paths.get(uri.getPath());
+  }
+
+  /**
+   * Get the list of expected JWT audience values.
+   *
+   * <p>When authorization is enabled, tokens must contain an {@code aud} value matching one of
+   * these entries (exact match or wildcard with {@code *}, same rules as {@link
+   * #getAllowedIssuers()}).
+   *
+   * <p>A single entry of {@code *} disables audience validation (issuer and user checks still
+   * apply). That sentinel cannot be combined with other values.
+   *
+   * @return List of expected audience values
+   */
+  public List<String> getAudiences() {
+    return getCommaSeparatedList(Property.AUDIENCES.key);
+  }
+
+  /**
+   * Returns true when {@code server.audiences} is exactly {@code *}, disabling JWT audience checks
+   * during token exchange.
+   */
+  public boolean isAudienceValidationDisabled() {
+    List<String> audiences = getAudiences();
+    return audiences.size() == 1 && "*".equals(audiences.get(0));
+  }
+
+  /**
+   * Parse a comma-separated property value into a list of trimmed, non-empty strings.
+   *
+   * @param key the property key to look up
+   * @return List of trimmed values, or empty list if the property is null or blank
+   */
+  private List<String> getCommaSeparatedList(String key) {
+    return splitCommaSeparated(getProperty(key));
+  }
+
+  private static List<String> splitCommaSeparated(String value) {
+    if (value == null || value.isBlank()) {
+      return List.of();
+    }
+    return Arrays.stream(value.split(",")).map(String::trim).filter(s -> !s.isEmpty()).toList();
+  }
+}

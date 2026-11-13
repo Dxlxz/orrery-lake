@@ -1,0 +1,270 @@
+package io.unitycatalog.server.auth.decorator;
+
+import static io.unitycatalog.server.model.SecurableType.CATALOG;
+import static io.unitycatalog.server.model.SecurableType.REGISTERED_MODEL;
+import static io.unitycatalog.server.model.SecurableType.SCHEMA;
+
+import io.unitycatalog.server.auth.annotation.ResponseAuthorizeFilter;
+import io.unitycatalog.server.exception.BaseException;
+import io.unitycatalog.server.exception.ErrorCode;
+import io.unitycatalog.server.model.CatalogInfo;
+import io.unitycatalog.server.model.CredentialInfo;
+import io.unitycatalog.server.model.ExternalLocationInfo;
+import io.unitycatalog.server.model.FunctionInfo;
+import io.unitycatalog.server.model.RegisteredModelInfo;
+import io.unitycatalog.server.model.SchemaInfo;
+import io.unitycatalog.server.model.SecurableType;
+import io.unitycatalog.server.model.TableInfo;
+import io.unitycatalog.server.model.VolumeInfo;
+import io.unitycatalog.server.persist.dao.TableInfoDAO;
+import io.unitycatalog.server.service.AuthorizedService;
+import java.util.HashMap;
+import java.util.List;
+import java.util.ListIterator;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.UnaryOperator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.expression.spel.SpelEvaluationException;
+
+/**
+ * Filters GET and LIST responses based on user authorization permissions.
+ *
+ * <p>This class is used in the authorization decorator layer to filter operation results. When a
+ * service method is annotated with {@code @ResponseAuthorizeFilter}, the {@link
+ * UnityAccessDecorator} creates a ResultFilter instance and stores it in the request context. The
+ * service method then retrieves this filter and calls it to remove items that the user is not
+ * authorized to access.
+ *
+ * <p><b>How It Works:</b>
+ *
+ * <ol>
+ *   <li>UnityAccessDecorator intercepts HTTP requests and extracts authorization parameters
+ *       (principal ID, expression, resource IDs) from method annotations
+ *   <li>It creates a ResultFilter with these parameters and stores it in the request context
+ *   <li>The service method retrieves the filter via {@code applyResponseFilter()} and applies it to
+ *       the response list
+ *   <li>The filter evaluates authorization for each item and removes unauthorized items
+ * </ol>
+ *
+ * <p><b>Resource ID Resolution:</b><br>
+ * For each item in the list, the filter resolves resource IDs of items but expect the catalog and
+ * schema IDs to be provided in the request already. Special handling exists for REGISTERED_MODEL
+ * because models can be listed without specifying catalog/schema filters. In this case, the filter
+ * extracts the catalog and schema names from each model and resolves them to IDs.
+ *
+ * <p><b>Security:</b><br>
+ * The {@code wasCalled()} method allows UnityAccessDecorator to verify that the filter was actually
+ * used. If a method is annotated with {@code @ResponseAuthorizeFilter} but doesn't call the filter,
+ * a security exception is thrown to prevent data leakage.
+ *
+ * @see ResponseAuthorizeFilter
+ * @see UnityAccessDecorator
+ * @see AuthorizedService#applyResponseFilter
+ */
+public class ResultFilter {
+  private static final Logger LOGGER = LoggerFactory.getLogger(ResultFilter.class);
+
+  private final UUID principalId;
+  private final String expression;
+  private final String browseExpression;
+  private final UnityAccessEvaluator evaluator;
+  private final Map<SecurableType, UUID> resourceIds;
+  private final Map<String, Object> nonResourceValues;
+  private final KeyMapper keyMapper;
+  private final AtomicBoolean called;
+
+  public ResultFilter(
+      UnityAccessEvaluator evaluator,
+      UUID principalId,
+      String expression,
+      String browseExpression,
+      Map<SecurableType, UUID> resourceIds,
+      Map<String, Object> nonResourceValues,
+      KeyMapper keyMapper) {
+    this.principalId = principalId;
+    this.expression = expression;
+    this.browseExpression = browseExpression;
+    this.evaluator = evaluator;
+    this.resourceIds = resourceIds;
+    this.nonResourceValues = nonResourceValues;
+    this.keyMapper = keyMapper;
+    this.called = new AtomicBoolean(false);
+  }
+
+  /**
+   * Filters a list of resources based on the user's authorization permissions.
+   *
+   * <p>This method evaluates the authorization expression for each item in the list and removes
+   * items that the user is not authorized to access. For each item, it:
+   *
+   * <ol>
+   *   <li>Resolves the item's resource ID (e.g., table ID, volume ID)
+   *   <li>Resolves parent (catalog and schema) resource IDs if it's registered model
+   *   <li>Evaluates the authorization expression with all resolved and provided IDs
+   *   <li>Removes the item if the expression evaluates to false
+   * </ol>
+   *
+   * <p>Explicit denials and 4xx {@link BaseException}s filter out the item. Unexpected errors fail
+   * the request so a failed authorization check cannot look like a successful list.
+   *
+   * @param securableType The type of resources being filtered (TABLE, VOLUME, FUNCTION, etc.)
+   * @param items The list of items to filter in-place. This list is modified by removing
+   *     unauthorized items.
+   * @param <T> The type of items in the list (e.g., TableInfo, VolumeInfo)
+   * @throws RuntimeException if the securableType is already resolved in the pre-resolved IDs,
+   *     which indicates a programming error
+   */
+  public <T> void filter(SecurableType securableType, List<T> items) {
+    filter(securableType, items, null);
+  }
+
+  /** Filters a page, replacing BROWSE-only items with the supplied allowed fields. */
+  public <T> void filter(SecurableType securableType, List<T> items, UnaryOperator<T> browseOnly) {
+    called.set(true);
+
+    if (items == null || items.isEmpty()) {
+      return;
+    }
+
+    LOGGER.debug("Filtering {} items with authorization expression", items.size());
+    if (resourceIds.containsKey(securableType)) {
+      // This simply indicates a bug in code.
+      throw new RuntimeException("Securable type " + securableType + " is already resolved");
+    }
+
+    // One batch for the whole list: the checks on shared parents (metastore, catalog, schema) are
+    // the same for every item, so they reach the authorizer once instead of once per item.
+    long operationStartNanos = System.nanoTime();
+    UnityAccessEvaluator.Batch batch =
+        evaluator.batch(principalId, expression, nonResourceValues, operationStartNanos);
+    UnityAccessEvaluator.Batch browseBatch =
+        browseOnly != null && !browseExpression.isEmpty()
+            ? evaluator.batch(principalId, browseExpression, nonResourceValues, operationStartNanos)
+            : null;
+
+    ListIterator<T> iterator = items.listIterator();
+    while (iterator.hasNext()) {
+      T item = iterator.next();
+      try {
+        Map<SecurableType, UUID> resourceIdsForItem =
+            resolveResourceIdsForItem(securableType, item, resourceIds);
+        T result = filterItem(item, resourceIdsForItem, browseOnly, batch, browseBatch);
+        if (result == null) {
+          iterator.remove();
+        } else {
+          iterator.set(result);
+        }
+      } catch (Exception e) {
+        // SpEL wraps client errors from privilege checks.
+        Throwable failure = e instanceof SpelEvaluationException ? e.getCause() : e;
+        if (!(failure instanceof BaseException baseException)) {
+          throw new BaseException(ErrorCode.INTERNAL, "Failed to authorize list items", e);
+        }
+        if (!baseException.getErrorCode().getHttpStatus().isClientError()) {
+          throw baseException;
+        }
+        LOGGER.warn("Error evaluating authorization for item, filtering out: {}", e.getMessage());
+        iterator.remove();
+      }
+    }
+
+    LOGGER.debug("After filtering: {} items remain", items.size());
+  }
+
+  /** Filters a GET result only if its ID matches the resource resolved from the request. */
+  public <T> T filterResult(SecurableType securableType, T item, UnaryOperator<T> browseOnly) {
+    called.set(true);
+    if (!resolveResourceId(securableType, item).equals(resourceIds.get(securableType))) {
+      throw new BaseException(ErrorCode.PERMISSION_DENIED, "Access denied.");
+    }
+    long operationStartNanos = System.nanoTime();
+    UnityAccessEvaluator.Batch batch =
+        evaluator.batch(principalId, expression, nonResourceValues, operationStartNanos);
+    UnityAccessEvaluator.Batch browseBatch =
+        browseOnly != null && !browseExpression.isEmpty()
+            ? evaluator.batch(principalId, browseExpression, nonResourceValues, operationStartNanos)
+            : null;
+    T result = filterItem(item, resourceIds, browseOnly, batch, browseBatch);
+    if (result == null) {
+      throw new BaseException(ErrorCode.PERMISSION_DENIED, "Access denied.");
+    }
+    return result;
+  }
+
+  private <T> T filterItem(
+      T item,
+      Map<SecurableType, UUID> ids,
+      UnaryOperator<T> browseOnly,
+      UnityAccessEvaluator.Batch batch,
+      UnityAccessEvaluator.Batch browseBatch) {
+    if (batch.evaluate(ids)) {
+      return item;
+    }
+    if (browseBatch != null && browseBatch.evaluate(ids)) {
+      return browseOnly.apply(item);
+    }
+    return null;
+  }
+
+  private Map<SecurableType, UUID> resolveResourceIdsForItem(
+      SecurableType securableType, Object item, Map<SecurableType, UUID> preResolvedIds) {
+    // First, resolve the item's own resource ID
+    UUID itemId = resolveResourceId(securableType, item);
+    Map<SecurableType, UUID> combined = new HashMap<>(preResolvedIds);
+    combined.put(securableType, itemId);
+    // For REGISTERED_MODEL, resolve catalog and schema if both are not present.
+    if (securableType == REGISTERED_MODEL
+        && !preResolvedIds.containsKey(CATALOG)
+        && !preResolvedIds.containsKey(SCHEMA)) {
+      RegisteredModelInfo model = (RegisteredModelInfo) item;
+      try {
+        combined.putAll(
+            keyMapper.mapResourceKeys(
+                Map.of(CATALOG, model.getCatalogName(), SCHEMA, model.getSchemaName())));
+      } catch (BaseException e) {
+        throw new BaseException(e.getErrorCode(), "Failed to authorize list items", e);
+      }
+    }
+    // For everything else, the catalog and schema IDs are already included in preResolvedIds
+    // if needed.
+    return combined;
+  }
+
+  private UUID resolveResourceId(SecurableType securableType, Object item) {
+    String id =
+        switch (securableType) {
+          // Table listings may filter over either the API model or the raw DAO (the Iceberg REST
+          // listTables path passes DAOs straight through to avoid materializing a TableInfo).
+          case TABLE ->
+              item instanceof TableInfoDAO dao
+                  ? dao.getId().toString()
+                  : ((TableInfo) item).getTableId();
+          case VOLUME -> ((VolumeInfo) item).getVolumeId();
+          case FUNCTION -> ((FunctionInfo) item).getFunctionId();
+          case REGISTERED_MODEL -> ((RegisteredModelInfo) item).getId();
+          case CATALOG -> ((CatalogInfo) item).getId();
+          case SCHEMA -> ((SchemaInfo) item).getSchemaId();
+          case CREDENTIAL -> ((CredentialInfo) item).getId();
+          case EXTERNAL_LOCATION -> ((ExternalLocationInfo) item).getId();
+          default -> throw new RuntimeException("Unsupported securable type: " + securableType);
+        };
+    return UUID.fromString(id);
+  }
+
+  /**
+   * Returns whether the filter has been called.
+   *
+   * <p>This method is used by {@link UnityAccessDecorator} to verify that methods annotated with
+   * {@code @ResponseAuthorizeFilter} actually call the filter on successful responses. This is a
+   * security enforcement mechanism to prevent data leakage when developers forget to filter
+   * results.
+   *
+   * @return true if {@link #filter} has been called at least once, false otherwise
+   */
+  public boolean wasCalled() {
+    return called.get();
+  }
+}

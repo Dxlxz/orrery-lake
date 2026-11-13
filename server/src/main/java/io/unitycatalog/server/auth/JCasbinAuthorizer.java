@@ -1,0 +1,291 @@
+package io.unitycatalog.server.auth;
+
+import io.unitycatalog.server.model.SecurableType;
+import io.unitycatalog.server.persist.model.Privileges;
+import io.unitycatalog.server.persist.utils.HibernateConfigurator;
+import io.unitycatalog.server.utils.ServerProperties;
+import java.io.InputStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.sql.Connection;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import javax.sql.DataSource;
+import org.apache.commons.io.IOUtils;
+import org.casbin.adapter.JDBCAdapter;
+import org.casbin.jcasbin.main.Enforcer;
+import org.casbin.jcasbin.main.SyncedEnforcer;
+import org.casbin.jcasbin.model.Model;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * An authorizer that uses the JCasbin library to enforce access control policies.
+ *
+ * <p>This class is an implementation of UnityCatalogAuthorizor that uses JCasbin as the back end to
+ * both store and enforce access control policies.
+ *
+ * <p>The implementation stores the policies in a database using the JDBCAdapter class. jdbc-adapter
+ * 2.7.0 pins one pooled connection for the authorizer lifetime; it does not check connections out
+ * per operation, so this shares a connection bound with Hibernate rather than the connections
+ * themselves. That checkout is forced to autocommit so policy reads do not sit idle-in-transaction
+ * on the Hibernate pool's autocommit-off default. A {@link SyncedEnforcer} is used because the UC
+ * server shares one authorizer across concurrent REST requests; jCasbin's plain {@link Enforcer} is
+ * not thread-safe for concurrent {@code enforce()} and policy mutations.
+ *
+ * <p>{@link CasbinPolicyRefresher} polls the shared {@code casbin_rule} table so grants and
+ * revocations made through other instances are picked up. Reload builds a fresh enforcer and swaps
+ * it under the exclusive side of {@code reloadLock} so {@code enforce()} keeps using the previous
+ * instance. Local writes take the shared side so they are not lost across the swap, but do not wait
+ * for each other.
+ */
+public class JCasbinAuthorizer implements UnityCatalogAuthorizer, AutoCloseable {
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(JCasbinAuthorizer.class);
+
+  private final AtomicReference<SyncedEnforcer> currentEnforcer = new AtomicReference<>();
+  final ReadWriteLock reloadLock = new ReentrantReadWriteLock();
+  private final JDBCAdapter adapter;
+  private final String modelText;
+  private final CasbinPolicyRefresher refresher;
+
+  private final boolean refreshEnabled;
+
+  private static final int PRINCIPAL_INDEX = 0;
+  private static final int RESOURCE_INDEX = 1;
+  private static final int PRIVILEGE_INDEX = 2;
+
+  private static final String HIERARCHY_POLICY = "g2";
+  private static final int HIERARCHY_PARENT_INDEX = 0;
+  private static final int HIERARCHY_CHILD_INDEX = 1;
+
+  public JCasbinAuthorizer(
+      HibernateConfigurator hibernateConfigurator, ServerProperties serverProperties)
+      throws Exception {
+    this.adapter = new JDBCAdapter(autocommitOnCheckout(hibernateConfigurator.getDataSource()));
+
+    InputStream modelStream = this.getClass().getResourceAsStream("/jcasbin_auth_model.conf");
+    this.modelText = IOUtils.toString(modelStream, StandardCharsets.UTF_8);
+    currentEnforcer.set(newEnforcer());
+
+    this.refreshEnabled = serverProperties.isPolicyRefreshEnabled();
+    this.refresher =
+        new CasbinPolicyRefresher(
+            this::reloadFromStore,
+            hibernateConfigurator.getSessionFactory(),
+            serverProperties.getPolicyRefreshMinProbeInterval());
+    if (refreshEnabled) {
+      refresher.start(serverProperties.getPolicyRefreshInterval());
+    } else {
+      LOGGER.info(
+          "Casbin policy refresh is disabled. Authorization changes made through another server"
+              + " instance will not be seen by this one, so running more than one instance against"
+              + " this database is unsafe.");
+    }
+  }
+
+  /**
+   * jdbc-adapter 2.7.0 calls {@link DataSource#getConnection()} once and holds it. Force autocommit
+   * on that checkout so {@code loadPolicy} does not leave Postgres/MySQL idle-in-transaction.
+   */
+  static DataSource autocommitOnCheckout(DataSource pool) {
+    return (DataSource)
+        Proxy.newProxyInstance(
+            DataSource.class.getClassLoader(),
+            new Class<?>[] {DataSource.class},
+            (proxy, method, args) -> {
+              try {
+                Object result = method.invoke(pool, args);
+                if (!(result instanceof Connection connection)) {
+                  return result;
+                }
+                try {
+                  connection.setAutoCommit(true);
+                  return connection;
+                } catch (Exception e) {
+                  try (connection) {
+                    throw e;
+                  }
+                }
+              } catch (InvocationTargetException e) {
+                throw e.getCause();
+              }
+            });
+  }
+
+  private SyncedEnforcer newEnforcer() {
+    Model model = new Model();
+    model.loadModelFromText(modelText);
+    SyncedEnforcer enforcer = new SyncedEnforcer(model, adapter);
+    enforcer.enableAutoSave(true);
+    return enforcer;
+  }
+
+  /**
+   * Rebuilds policy from {@code casbin_rule} on a new enforcer and swaps it in. Holds the exclusive
+   * lock for the whole load so local grants are not applied to the outgoing instance.
+   */
+  void reloadFromStore() {
+    reloadLock.writeLock().lock();
+    try {
+      currentEnforcer.set(newEnforcer());
+    } finally {
+      reloadLock.writeLock().unlock();
+    }
+  }
+
+  /**
+   * Runs a policy mutation on the live enforcer.
+   *
+   * <p>Takes the <em>read</em> side of {@code reloadLock} on purpose: many grants may proceed
+   * together (SyncedEnforcer still serializes mutations on one instance), while reload takes the
+   * write side so a mutation cannot land on an enforcer that is about to be discarded. The lock
+   * names refer to the live-enforcer pointer, not to Casbin read vs write.
+   */
+  private <T> T mutate(Function<SyncedEnforcer, T> action) {
+    reloadLock.readLock().lock();
+    try {
+      return action.apply(currentEnforcer.get());
+    } finally {
+      reloadLock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public boolean grantAuthorization(UUID principal, UUID resource, Privileges action) {
+    return mutate(e -> e.addPolicy(principal.toString(), resource.toString(), action.toString()));
+  }
+
+  @Override
+  public boolean revokeAuthorization(UUID principal, UUID resource, Privileges action) {
+    return mutate(
+        e -> e.removePolicy(principal.toString(), resource.toString(), action.toString()));
+  }
+
+  @Override
+  public boolean clearAuthorizationsForPrincipal(UUID principal) {
+    return mutate(e -> e.removeFilteredPolicy(PRINCIPAL_INDEX, principal.toString()));
+  }
+
+  @Override
+  public boolean clearAuthorizationsForResource(UUID resource) {
+    return mutate(e -> e.removeFilteredPolicy(RESOURCE_INDEX, resource.toString()));
+  }
+
+  @Override
+  public boolean addHierarchyChild(UUID parent, UUID child) {
+    return mutate(
+        e -> e.addNamedGroupingPolicy(HIERARCHY_POLICY, parent.toString(), child.toString()));
+  }
+
+  @Override
+  public boolean removeHierarchyChild(UUID parent, UUID child) {
+    return mutate(
+        e -> e.removeNamedGroupingPolicy(HIERARCHY_POLICY, parent.toString(), child.toString()));
+  }
+
+  @Override
+  public boolean removeHierarchyChildren(UUID resource) {
+    return mutate(
+        e ->
+            e.removeFilteredNamedGroupingPolicy(
+                HIERARCHY_POLICY, HIERARCHY_PARENT_INDEX, resource.toString()));
+  }
+
+  @Override
+  public UUID getHierarchyParent(UUID resource) {
+    List<List<String>> policy =
+        currentEnforcer
+            .get()
+            .getFilteredNamedGroupingPolicy(
+                HIERARCHY_POLICY, HIERARCHY_CHILD_INDEX, resource.toString());
+    if (policy.isEmpty() || policy.get(0).isEmpty()) {
+      return null;
+    }
+    return UUID.fromString(policy.get(0).get(HIERARCHY_PARENT_INDEX));
+  }
+
+  @Override
+  public boolean authorize(
+      UUID principal, SecurableType resourceType, UUID resource, Privileges action) {
+    return currentEnforcer
+        .get()
+        .enforce(principal.toString(), resource.toString(), action.toString());
+  }
+
+  @Override
+  public boolean authorizeAny(
+      UUID principal, SecurableType resourceType, UUID resource, Privileges... actions) {
+    SyncedEnforcer enforcer = currentEnforcer.get();
+    return Arrays.stream(actions)
+        .anyMatch(
+            action ->
+                enforcer.enforce(principal.toString(), resource.toString(), action.toString()));
+  }
+
+  @Override
+  public boolean authorizeAll(
+      UUID principal, SecurableType resourceType, UUID resource, Privileges... actions) {
+    SyncedEnforcer enforcer = currentEnforcer.get();
+    return Arrays.stream(actions)
+        .allMatch(
+            action ->
+                enforcer.enforce(principal.toString(), resource.toString(), action.toString()));
+  }
+
+  @Override
+  public List<Privileges> listAuthorizations(UUID principal, UUID resource) {
+    List<List<String>> list =
+        currentEnforcer
+            .get()
+            .getPermissionsForUserInDomain(principal.toString(), resource.toString());
+    return list.stream()
+        .map(l -> l.get(PRIVILEGE_INDEX))
+        .map(Privileges::fromValue)
+        .collect(Collectors.toList());
+  }
+
+  @Override
+  public Map<UUID, List<Privileges>> listAuthorizations(UUID resource) {
+    return currentEnforcer.get().getFilteredPolicy(RESOURCE_INDEX, resource.toString()).stream()
+        .collect(
+            Collectors.groupingBy(
+                l -> UUID.fromString(l.get(PRINCIPAL_INDEX)),
+                Collectors.mapping(
+                    l -> Privileges.fromValue(l.get(PRIVILEGE_INDEX)), Collectors.toList())));
+  }
+
+  /**
+   * Reload after a deny if the in-memory policy may be stale. Returns true when the caller should
+   * re-evaluate.
+   */
+  @Override
+  public boolean refreshAuthorizations(long operationStartNanos) {
+    if (!refreshEnabled) {
+      return false;
+    }
+    return refresher.checkAndReloadAfter(operationStartNanos);
+  }
+
+  @Override
+  public void close() {
+    refresher.close();
+    try {
+      adapter.close();
+    } catch (Exception e) {
+      LOGGER.warn("Failed to close the Casbin JDBC adapter", e);
+    }
+  }
+
+  CasbinPolicyRefresher getRefresher() {
+    return refresher;
+  }
+}

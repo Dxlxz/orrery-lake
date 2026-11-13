@@ -1,0 +1,1825 @@
+# unitycatalog-chart
+
+This chart deploys [Unity Catalog](https://github.com/Dxlxz/orrery-lake) on a Kubernetes cluster
+using the [Helm](https://github.com/helm/helm) package manager.
+
+## Prerequisites
+- Kubernetes 1.20+ cluster
+- Helm 3.8+
+
+## Features
+- Deploys Unity Catalog server and UI
+- Supports OAuth authentication
+- Supports file H2DB, PostgreSQL and MySQL as a database
+- Customizable configuration for server and UI using Helm values
+
+## Installing the Chart
+Starting with 0.8.0, each Unity Catalog release publishes this chart to Docker Hub, with the same version as the release.
+To install release X.Y.Z with the release name `unitycatalog`:
+
+```sh
+helm install unitycatalog oci://registry-1.docker.io/Dxlxz/orrery-lake-chart --version X.Y.Z
+```
+
+Chart version X.Y.Z runs the server image `Dxlxz/orrery-lake:vX.Y.Z` and the UI image `Dxlxz/orrery-lake-ui:vX.Y.Z`.
+
+## Uninstalling the Chart
+To uninstall the `unitycatalog` chart:
+
+```sh
+helm uninstall unitycatalog
+```
+
+The command deletes the release. It keeps the H2 database PersistentVolumeClaim and the token signing key Secret;
+delete both to remove the data.
+
+## Audit records
+Turn on [audit records](https://github.com/Dxlxz/orrery-lake/blob/main/docs/server/configuration.md#audit-records)
+to write one JSON line per issued storage credential, permission change and queued storage cleanup
+to `/home/unitycatalog/etc/logs/audit.log`; the chart already configures the `audit` logger. The
+file is lost when the pod restarts, so ship it continuously (for example from a sidecar in
+`server.deployment.extraContainers`) or keep the directory on a volume:
+
+```yaml
+server:
+  config:
+    extraProperties:
+      server.audit.sink: io.unitycatalog.server.audit.FileAuditSink
+```
+
+## Configuration
+The following table lists the configurable parameters of the Unity Catalog chart and their default values.
+
+> **Note**
+>
+> Auth integration in UI works only with Google OAuth provider and
+> it does not work with UC versions 0.2.1 and below.
+
+## Values
+
+<table>
+	<thead>
+		<th>Key</th>
+		<th>Type</th>
+		<th>Default</th>
+		<th>Description</th>
+	</thead>
+	<tbody>
+		<tr>
+			<td>auth.accessTokenTimeout</td>
+			<td>string</td>
+			<td><pre lang="">
+PT24H
+</pre>
+</td>
+			<td>UC access token lifetime for token exchange
+
+Example: `PT24H` (24 hours), `P7D` (7 days)
+</td>
+		</tr>
+		<tr>
+			<td>auth.allowedIssuers</td>
+			<td>string</td>
+			<td><pre lang="">
+https://accounts.google.com
+</pre>
+</td>
+			<td>Comma-separated list of allowed token issuers
+
+When authorization is enabled, tokens will only be accepted from issuers in this list.
+Supports exact match or wildcard patterns with * (single DNS label per wildcard).
+Cannot be "*" alone. Wildcard issuers are evaluated before signature verification;
+see docs/server/auth.md.
+
+Example for Google: `https://accounts.google.com`
+Example for Microsoft Entra ID: `https://login.microsoftonline.com/{tenant-id}/v2.0`
+</td>
+		</tr>
+		<tr>
+			<td>auth.allowedJwksUris</td>
+			<td>string</td>
+			<td><pre lang="">
+https://www.googleapis.com/oauth2/v3/certs
+</pre>
+</td>
+			<td>Comma-separated list of exact JWKS URLs allowed on other origins
+
+Match each provider's discovery URL, including any explicit port. Wildcards are not supported.
+</td>
+		</tr>
+		<tr>
+			<td>auth.audiences</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Comma-separated list of expected JWT audience values
+
+When authorization is enabled, tokens must contain an aud value matching one of these entries.
+Supports exact match or wildcard patterns with * (same rules as allowedIssuers).
+Use "*" alone to disable audience validation (issuer and user checks still apply).
+</td>
+		</tr>
+		<tr>
+			<td>auth.authorizationUrl</td>
+			<td>string</td>
+			<td><pre lang="">
+https://accounts.google.com/o/oauth2/auth
+</pre>
+</td>
+			<td>OAuth authorization URL
+
+Example: `https://accounts.google.com/o/oauth2/auth`
+</td>
+		</tr>
+		<tr>
+			<td>auth.clientSecretName</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>OAuth client secret name
+
+Client secret must contain the following key:
+- `clientId`: OAuth client ID
+
+The server doesn't read the OAuth client secret. A `clientSecret` key is passed only to a
+`server.config.override` or `extraProperties` template that uses `${OAUTH_CLIENT_SECRET}`.
+</td>
+		</tr>
+		<tr>
+			<td>auth.cookieTimeout</td>
+			<td>string</td>
+			<td><pre lang="json">
+"P5D"
+</pre>
+</td>
+			<td>OAuth cookie timeout
+
+Example: `P5D` (5 days)
+</td>
+		</tr>
+		<tr>
+			<td>auth.enabled</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable OAuth authentication</td>
+		</tr>
+		<tr>
+			<td>auth.provider</td>
+			<td>string</td>
+			<td><pre lang="">
+google
+</pre>
+</td>
+			<td>OAuth provider
+
+Supported values: `google`, `other`
+
+other: Use this option if you want to use a custom OAuth provider. UI does not have any built-in support for this option.
+</td>
+		</tr>
+		<tr>
+			<td>auth.redirectPort</td>
+			<td>int</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>OAuth redirect port</td>
+		</tr>
+		<tr>
+			<td>auth.tokenUrl</td>
+			<td>string</td>
+			<td><pre lang="">
+https://oauth2.googleapis.com/token
+</pre>
+</td>
+			<td>OAuth token URL
+
+Example: `https://oauth2.googleapis.com/token`
+</td>
+		</tr>
+		<tr>
+			<td>auth.users</td>
+			<td>array</td>
+			<td><pre lang="yaml">
+not set
+</pre>
+</td>
+			<td>List of users to be created in the system
+
+TODO: It is not possible to create proper admin account. This is a workaround.
+
+Example:
+```yaml
+users:
+- name: admin
+  email: test@example.com
+  canCreateCatalogs: true    # Optional (default: false)
+```
+</td>
+		</tr>
+		<tr>
+			<td>fullnameOverride</td>
+			<td>string</td>
+			<td><pre lang="">
+derived from the release name and nameOverride
+</pre>
+</td>
+			<td>Override the full name of the chart</td>
+		</tr>
+		<tr>
+			<td>httpRoute.annotations</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>HTTPRoute annotations</td>
+		</tr>
+		<tr>
+			<td>httpRoute.enabled</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable httpRoute for the server
+
+[Kubernetes docs](https://gateway-api.sigs.k8s.io/api-types/httproute/)
+</td>
+		</tr>
+		<tr>
+			<td>httpRoute.host</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>HTTPRoute host configuration (Required for httpRoute)</td>
+		</tr>
+		<tr>
+			<td>httpRoute.parentRefs</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>HTTPRoute parent references
+
+Example:
+```yaml
+parentRefs:
+  - name: my-gateway
+    namespace: my-namespace
+    kind: Gateway
+    group: gateway.networking.k8s.io
+```
+</td>
+		</tr>
+		<tr>
+			<td>ingress.annotations</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Ingress annotations</td>
+		</tr>
+		<tr>
+			<td>ingress.enabled</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable ingress for the server
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+</td>
+		</tr>
+		<tr>
+			<td>ingress.host</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Ingress host configuration (Required for TLS)</td>
+		</tr>
+		<tr>
+			<td>ingress.ingressClassName</td>
+			<td>string</td>
+			<td><pre lang="">
+default ingress class
+</pre>
+</td>
+			<td>Ingress class name</td>
+		</tr>
+		<tr>
+			<td>ingress.tlsSecretName</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Ingress TLS secret name
+
+If set, TLS will be enabled for the ingress
+</td>
+		</tr>
+		<tr>
+			<td>nameOverride</td>
+			<td>string</td>
+			<td><pre lang="">
+unitycatalog
+</pre>
+</td>
+			<td>Override the name used in resource names</td>
+		</tr>
+		<tr>
+			<td>server.config.extraProperties</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Extra config properties that will be added to server.properties
+
+Example:
+```yaml
+extraProperties:
+  my-config.property1: my-value1
+  my-config.property2: my-value2
+```
+
+Do not put secrets here: a secret in `server.properties` is deprecated.
+</td>
+		</tr>
+		<tr>
+			<td>server.config.override</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Server configuration template override
+
+Example:
+```
+server.env=prod
+server.port=8080
+...other config properties...
+```
+
+Do not put secrets here: the chart passes the S3 and ADLS secrets to the server as environment
+variables, and a secret in `server.properties` is deprecated. A template that uses `${OAUTH_CLIENT_SECRET}`,
+`${S3_SECRET_KEY_<n>}` or `${ADLS_CLIENT_SECRET_<n>}` still gets them, but that is deprecated
+too: the server reads `UC_S3_SECRETKEY_<n>` and `UC_ADLS_CLIENTSECRET_<n>` from its environment.
+</td>
+		</tr>
+		<tr>
+			<td>server.createUsersJob.backoffLimit</td>
+			<td>int</td>
+			<td><pre lang="">
+5
+</pre>
+</td>
+			<td>Backoff limit for the create users job
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/)
+</td>
+		</tr>
+		<tr>
+			<td>server.createUsersJob.extraAnnotations</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Additional annotations for the create users job
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+</td>
+		</tr>
+		<tr>
+			<td>server.createUsersJob.image.pullPolicy</td>
+			<td>string</td>
+			<td><pre lang="json">
+"IfNotPresent"
+</pre>
+</td>
+			<td>Pull policy for the create users job image</td>
+		</tr>
+		<tr>
+			<td>server.createUsersJob.image.repository</td>
+			<td>string</td>
+			<td><pre lang="json">
+"alpine"
+</pre>
+</td>
+			<td>Repository for the create users job image</td>
+		</tr>
+		<tr>
+			<td>server.createUsersJob.image.tag</td>
+			<td>string</td>
+			<td><pre lang="json">
+"3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6"
+</pre>
+</td>
+			<td>Tag for the create users job image, pinned by digest</td>
+		</tr>
+		<tr>
+			<td>server.createUsersJob.ttlSecondsAfterFinished</td>
+			<td>int</td>
+			<td><pre lang="">
+300
+</pre>
+</td>
+			<td>TTL for the create users job (in seconds)
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/ttlafterfinished/)
+</td>
+		</tr>
+		<tr>
+			<td>server.db.fileConfig.persistence.accessModes</td>
+			<td>array</td>
+			<td><pre lang="json">
+[
+  "ReadWriteOnce"
+]
+</pre>
+</td>
+			<td>Access modes for the file database volume</td>
+		</tr>
+		<tr>
+			<td>server.db.fileConfig.persistence.createPVC</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Create a new file database volume if it does not exist</td>
+		</tr>
+		<tr>
+			<td>server.db.fileConfig.persistence.enabled</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Enable persistence for the file database volume
+
+If set to false, all data will be lost when the pod is deleted
+</td>
+		</tr>
+		<tr>
+			<td>server.db.fileConfig.persistence.pvcName</td>
+			<td>string</td>
+			<td><pre lang="">
+derived from the chart parameters and metadata
+</pre>
+</td>
+			<td>Name of the file database persistence volume claim</td>
+		</tr>
+		<tr>
+			<td>server.db.fileConfig.persistence.size</td>
+			<td>string</td>
+			<td><pre lang="json">
+"1Gi"
+</pre>
+</td>
+			<td>Size of the file database volume
+
+Example: `1Gi`
+</td>
+		</tr>
+		<tr>
+			<td>server.db.fileConfig.persistence.storageClassName</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Storage class for the file database volume
+
+If not set, the default storage class will be used
+</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.dbName</td>
+			<td>string</td>
+			<td><pre lang="">
+ucdb
+</pre>
+</td>
+			<td>MySQL database name</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.driver.subPath</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Path of the driver jar in `volume` (Required)
+
+To change the driver version, put the new jar on the volume and point `subPath` at it.
+
+Example: `mysql-connector-j-8.4.0.jar`
+</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.driver.volume</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Volume that holds the MySQL JDBC driver jar (Required)
+
+The server image does not include the MySQL JDBC driver
+([MySQL Connector/J](https://dev.mysql.com/downloads/connector/j/)), because it is licensed under the GPL;
+the PostgreSQL driver it does include is BSD-licensed. The chart mounts the jar at `subPath` in this volume
+into the server and puts it on the Java module path. Any volume source works, for example a
+PersistentVolumeClaim. The driver jar is larger than a ConfigMap can hold.
+
+Example:
+```yaml
+volume:
+  persistentVolumeClaim:
+    claimName: mysql-driver
+```
+</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.extraParams</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>MySQL JDBC URL params
+
+Example:
+```yaml
+extraParams:
+  sslMode: VERIFY_IDENTITY
+```
+</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.host</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>MySQL database host (Required)</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.passwordSecretKey</td>
+			<td>string</td>
+			<td><pre lang="">
+password
+</pre>
+</td>
+			<td>MySQL user password secret key</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.passwordSecretName</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>MySQL user password secret name
+
+If not set, connection will be made without a password
+</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.port</td>
+			<td>int</td>
+			<td><pre lang="">
+3306
+</pre>
+</td>
+			<td>MySQL database port</td>
+		</tr>
+		<tr>
+			<td>server.db.mysqlConfig.username</td>
+			<td>string</td>
+			<td><pre lang="">
+root
+</pre>
+</td>
+			<td>MySQL username</td>
+		</tr>
+		<tr>
+			<td>server.db.overrideConfig</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Override Hibernate configuration for the server
+
+Do not put the password here: set `passwordSecretName` and `passwordSecretKey` of the
+database's config; with `db.type: postgresql` or `mysql` the chart passes the password to the
+server as an environment variable. A password in `hibernate.properties` is deprecated.
+If the template sets `hibernate.connection.password=${DB_PASSWORD}`, remove that line: the
+server reads the password from `UC_HIBERNATE_CONNECTION_PASSWORD`.
+</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.dbName</td>
+			<td>string</td>
+			<td><pre lang="">
+ucdb
+</pre>
+</td>
+			<td>PostgreSQL database name</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.extraParams</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Postgres params
+
+Example:
+```yaml
+params:
+  sslfactory: my.custom.SSLFactory
+```
+</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.host</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>PostgreSQL database host (Required)
+
+Example: `mydb.123456789012.us-east-1.rds.amazonaws.com`
+</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.passwordSecretKey</td>
+			<td>string</td>
+			<td><pre lang="">
+password
+</pre>
+</td>
+			<td>PostgreSQL user password secret key</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.passwordSecretName</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>PostgreSQL user password secret name
+
+If not set, connection will be made without a password
+</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.port</td>
+			<td>int</td>
+			<td><pre lang="">
+5432
+</pre>
+</td>
+			<td>PostgreSQL database port</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.ssl.enabled</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td></td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.ssl.mode</td>
+			<td>string</td>
+			<td><pre lang="">
+verify-full
+</pre>
+</td>
+			<td>PostgreSQL SSL mode
+
+[Documentation](https://jdbc.postgresql.org/documentation/ssl/)
+</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.ssl.rootCert</td>
+			<td>string</td>
+			<td><pre lang="">
+public root CAs
+</pre>
+</td>
+			<td>PostgreSQL SSL root certificate
+
+Example:
+```yaml
+rootCert: |
+  -----BEGIN CERTIFICATE-----
+  ...certificate data...
+  -----END CERTIFICATE-----
+```
+</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.ssl.rootCertConfigMapKey</td>
+			<td>string</td>
+			<td><pre lang="">
+ca.crt
+</pre>
+</td>
+			<td>PostgreSQL SSL root certificate config map key</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.ssl.rootCertConfigMapName</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>PostgreSQL SSL root certificate config map name</td>
+		</tr>
+		<tr>
+			<td>server.db.postgresqlConfig.username</td>
+			<td>string</td>
+			<td><pre lang="">
+postgres
+</pre>
+</td>
+			<td>PostgreSQL username</td>
+		</tr>
+		<tr>
+			<td>server.db.type</td>
+			<td>string</td>
+			<td><pre lang="json">
+"file"
+</pre>
+</td>
+			<td>Database type
+
+Supported values: `file`, `postgresql`, `mysql`
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.affinity</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Node affinity for the deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.command</td>
+			<td>array</td>
+			<td><pre lang="json">
+[
+  "./bin/start-uc-server"
+]
+</pre>
+</td>
+			<td>Command that starts the server
+
+The chart passes `--port`, and `--obs-port` when `obsPort` is set, as the container's `args`.
+Kubernetes runs this command instead of the image's `ENTRYPOINT`, so an image that starts
+through its own wrapper can set it here; the wrapper must pass the arguments on to
+`./bin/start-uc-server`.
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.enableLivenessProbe</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable liveness probe
+
+If set to true, the liveness probe will be enabled.
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.enableReadinessProbe</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable readiness probe
+
+If set to true, the readiness probe will be enabled.
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.enableStartupProbe</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Enable startup probe
+
+If set to true, the startup probe will be enabled.
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.extraContainers</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional containers to be added to the server pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.extraInitContainers</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional init containers to be added to the server pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.extraPodAnnotations</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Additional annotations for the pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.extraPodLabels</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Additional labels for the pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.extraVolumeMounts</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional volume mounts for the pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.extraVolumes</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional volumes to be mounted in the pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.image.pullPolicy</td>
+			<td>string</td>
+			<td><pre lang="json">
+"IfNotPresent"
+</pre>
+</td>
+			<td>Pull policy for the server image</td>
+		</tr>
+		<tr>
+			<td>server.deployment.image.repository</td>
+			<td>string</td>
+			<td><pre lang="json">
+"Dxlxz/orrery-lake"
+</pre>
+</td>
+			<td>Repository for the server image</td>
+		</tr>
+		<tr>
+			<td>server.deployment.image.tag</td>
+			<td>string</td>
+			<td><pre lang="">
+{{ .Chart.AppVersion }}
+</pre>
+</td>
+			<td>Tag for the server image
+
+Use the server image from the same release as the chart. The chart passes secrets to
+the server as environment variables that older server images don't read.
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.imagePullSecrets</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Image pull secrets for the server
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.initContainer.image.pullPolicy</td>
+			<td>string</td>
+			<td><pre lang="json">
+"IfNotPresent"
+</pre>
+</td>
+			<td>Pull policy for the render config container</td>
+		</tr>
+		<tr>
+			<td>server.deployment.initContainer.image.repository</td>
+			<td>string</td>
+			<td><pre lang="json">
+"alpine"
+</pre>
+</td>
+			<td>Repository for the render config container</td>
+		</tr>
+		<tr>
+			<td>server.deployment.initContainer.image.tag</td>
+			<td>string</td>
+			<td><pre lang="json">
+"3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6"
+</pre>
+</td>
+			<td>Tag for the render config container, pinned by digest</td>
+		</tr>
+		<tr>
+			<td>server.deployment.initContainer.securityContext</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Security context for the init container
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.lifecycle</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Lifecycle hooks for the server container
+
+On SIGTERM the server stops taking new requests and finishes the ones in flight, for up to
+the `server.shutdown-timeout` server property (set under `server.config.extraProperties`).
+Kubernetes can still route requests to the pod for a few seconds after it starts terminating,
+so a `preStop` sleep keeps the server serving until they stop arriving:
+
+```yaml
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "10"]
+```
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.livenessProbe</td>
+			<td>object</td>
+			<td><pre lang="">
+with obsPort: httpGet `/livez` on port obs; otherwise tcpSocket on port api. timeoutSeconds: 10, periodSeconds: 10, failureThreshold: 30 (5 minutes)
+</pre>
+</td>
+			<td>Liveness probe
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.nodeSelector</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Node selector for the deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.obsPort</td>
+			<td>int</td>
+			<td><pre lang="">
+not set (observability off)
+</pre>
+</td>
+			<td>Observability port for the server deployment
+
+When set, the server starts with `--obs-port` and serves `/livez`, `/readyz` and `/metrics`
+on this port, without authentication. The readiness and liveness probes, when turned on,
+then check `/readyz` and `/livez`; without it they check that the API port accepts a
+connection. The Service doesn't expose the port, but other pods can reach it
+on the pod IP; restrict it with a NetworkPolicy if needed, and allow the kubelet to reach it
+for the probes. Must differ from `port`. Needs server image v0.7.0 or later.
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.podSecurityContext</td>
+			<td>object</td>
+			<td><pre lang="json">
+{
+  "fsGroup": 101
+}
+</pre>
+</td>
+			<td>Security context for the pod
+
+By default, the pod security context has `fsGroup` set to `101` to allow the container
+to write to the mounted volumes.
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.port</td>
+			<td>int</td>
+			<td><pre lang="json">
+8080
+</pre>
+</td>
+			<td>Port the server listens on for API requests</td>
+		</tr>
+		<tr>
+			<td>server.deployment.readinessProbe</td>
+			<td>object</td>
+			<td><pre lang="">
+with obsPort: httpGet `/readyz` on port obs, failureThreshold: 3; otherwise tcpSocket on port api, failureThreshold: 30 (5 minutes). timeoutSeconds: 10, periodSeconds: 10
+</pre>
+</td>
+			<td>Readiness probe
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.replicaCount</td>
+			<td>int</td>
+			<td><pre lang="json">
+1
+</pre>
+</td>
+			<td>Number of replicas
+
+For replica count higher than 1 - use an external database
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.resources</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Resources for the deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.securityContext</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Security context for the container
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.startupProbe</td>
+			<td>object</td>
+			<td><pre lang="">
+tcpSocket:<br>  port: api<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+</pre>
+</td>
+			<td>Startup probe
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.terminationGracePeriodSeconds</td>
+			<td>int</td>
+			<td><pre lang="">
+not set (Kubernetes uses 30)
+</pre>
+</td>
+			<td>Seconds Kubernetes waits for the pod to stop before killing it
+
+Set it to more than the `preStop` sleep plus the whole shutdown time. The `server.shutdown-timeout`
+entry in the server configuration reference describes it: the timeout plus time for storage
+cleanup and for stopping the HTTP server.
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.tolerations</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Tolerations for the deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+</td>
+		</tr>
+		<tr>
+			<td>server.deployment.updateStrategy</td>
+			<td>object</td>
+			<td><pre lang="">
+# If replicaCount: 1 and db type "file"<br>type: Recreate<br># Else<br>type: RollingUpdate
+</pre>
+</td>
+			<td>Update strategy for the deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)
+</td>
+		</tr>
+		<tr>
+			<td>server.enabled</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Enable the server deployment</td>
+		</tr>
+		<tr>
+			<td>server.hibernateConfigOverride</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Server hibernate configuration template override
+
+Example:
+```
+hibernate.dialect=org.hibernate.dialect.MySQLDialect
+hibernate.connection.driver_class=com.mysql.cj.jdbc.Driver
+...other hibernate config properties...
+```
+</td>
+		</tr>
+		<tr>
+			<td>server.jwtKeypairSecret.create</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Create keypair secret
+
+If set to true, the secret will be created with a random keypair
+</td>
+		</tr>
+		<tr>
+			<td>server.jwtKeypairSecret.name</td>
+			<td>string</td>
+			<td><pre lang="">
+derived from the chart parameters and metadata
+</pre>
+</td>
+			<td>Name of the keypair secret for JWT signing
+
+The secret must contain the following keys:
+- `private_key.der` or `private_key.pem`: Private key in DER or PEM format
+- `key_id.txt`: Key ID
+
+[Kubernetes docs](https://github.com/Dxlxz/orrery-lake/blob/main/server/src/main/java/io/unitycatalog/server/security/SecurityConfiguration.java)
+</td>
+		</tr>
+		<tr>
+			<td>server.logLevel</td>
+			<td>string</td>
+			<td><pre lang="">
+info
+</pre>
+</td>
+			<td>Log level for the server</td>
+		</tr>
+		<tr>
+			<td>server.service.port</td>
+			<td>int</td>
+			<td><pre lang="json">
+8080
+</pre>
+</td>
+			<td>Service port for the server</td>
+		</tr>
+		<tr>
+			<td>server.service.type</td>
+			<td>string</td>
+			<td><pre lang="json">
+"ClusterIP"
+</pre>
+</td>
+			<td>Service type for the server</td>
+		</tr>
+		<tr>
+			<td>serviceAccount.annotations</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Annotations for the service account</td>
+		</tr>
+		<tr>
+			<td>serviceAccount.automount</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Automount the service account token</td>
+		</tr>
+		<tr>
+			<td>serviceAccount.create</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Create a service account</td>
+		</tr>
+		<tr>
+			<td>serviceAccount.name</td>
+			<td>string</td>
+			<td><pre lang="">
+derived from the chart parameters and metadata
+</pre>
+</td>
+			<td>Name of the service account</td>
+		</tr>
+		<tr>
+			<td>storage.credentials.adls</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>ADLS credentials for accessing the storage
+
+Example:
+```yaml
+adls:
+- storageAccountName: my-storage-account
+  credentialsSecretName: my-storage-secret
+```
+
+Credential secret must contain the following keys:
+- `tenantId`: Azure tenant ID
+- `clientId`: Azure client ID
+- `clientSecret`: Azure client secret
+</td>
+		</tr>
+		<tr>
+			<td>storage.credentials.gcs</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>GCS credentials for accessing the storage
+
+Example:
+```yaml
+gcs:
+- bucketPath: gs://my-bucket-name
+  credentialsSecretName: my-bucket-secret
+```
+
+Credential secret must contain the following keys:
+- `jsonKey`: GCP service account JSON key
+</td>
+		</tr>
+		<tr>
+			<td>storage.credentials.s3</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>S3 credentials for accessing the storage
+
+Example:
+```yaml
+s3:
+- bucketPath: s3://my-bucket-path
+  region: us-east-1
+  awsRoleArn: arn:aws:iam::123456789012:role/my-role
+  credentialsSecretName: my-bucket-secret
+```
+
+Credential secret must contain the following keys:
+- `accessKey`: AWS access key
+- `secretKey`: AWS secret key
+</td>
+		</tr>
+		<tr>
+			<td>storage.modelStorageRoot</td>
+			<td>string</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Root path for the model storage
+
+Example: `s3://bucket/path`
+</td>
+		</tr>
+		<tr>
+			<td>test.image.pullPolicy</td>
+			<td>string</td>
+			<td><pre lang="json">
+"IfNotPresent"
+</pre>
+</td>
+			<td>Pull policy for the `helm test` pod image</td>
+		</tr>
+		<tr>
+			<td>test.image.repository</td>
+			<td>string</td>
+			<td><pre lang="json">
+"busybox"
+</pre>
+</td>
+			<td>Repository for the `helm test` pod image</td>
+		</tr>
+		<tr>
+			<td>test.image.tag</td>
+			<td>string</td>
+			<td><pre lang="json">
+"1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+</pre>
+</td>
+			<td>Tag for the `helm test` pod image, pinned by digest</td>
+		</tr>
+		<tr>
+			<td>test.imagePullSecrets</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Image pull secrets for the `helm test` pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.affinity</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Node affinity for the UI deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.enableLivenessProbe</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable liveness probe
+
+If set to true, the liveness probe will be enabled.
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.enableReadinessProbe</td>
+			<td>bool</td>
+			<td><pre lang="json">
+false
+</pre>
+</td>
+			<td>Enable readiness probe
+
+If set to true, the readiness probe will be enabled.
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.enableStartupProbe</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Enable startup probe
+
+If set to true, the startup probe will be enabled.
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.extraContainers</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional containers to be added to the UI pods
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.extraInitContainers</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional init containers to be added to the UI pods
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.extraPodAnnotations</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Additional annotations for the UI pods
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.extraPodLabels</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Additional labels for the UI pods
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.extraVolumeMounts</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional volume mounts for the pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.extraVolumes</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>List of additional volumes to be mounted in the pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.image.pullPolicy</td>
+			<td>string</td>
+			<td><pre lang="json">
+"IfNotPresent"
+</pre>
+</td>
+			<td>Pull policy for the UI image</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.image.repository</td>
+			<td>string</td>
+			<td><pre lang="json">
+"Dxlxz/orrery-lake-ui"
+</pre>
+</td>
+			<td>Repository for the UI image</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.image.tag</td>
+			<td>string</td>
+			<td><pre lang="">
+{{ .Chart.AppVersion }}
+</pre>
+</td>
+			<td>Tag for the UI image</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.imagePullSecrets</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Image pull secrets for the UI
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.initContainer.image.pullPolicy</td>
+			<td>string</td>
+			<td><pre lang="json">
+"IfNotPresent"
+</pre>
+</td>
+			<td>Pull policy for the UI init container</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.initContainer.image.repository</td>
+			<td>string</td>
+			<td><pre lang="json">
+"busybox"
+</pre>
+</td>
+			<td>Repository for the UI init container</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.initContainer.image.tag</td>
+			<td>string</td>
+			<td><pre lang="json">
+"1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+</pre>
+</td>
+			<td>Tag for the UI init container, pinned by digest</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.initContainer.securityContext</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Security context for the init container
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.livenessProbe</td>
+			<td>object</td>
+			<td><pre lang="">
+tcpSocket:<br>  port: ui<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+</pre>
+</td>
+			<td>Liveness probe
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.nodeSelector</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Node selector for the UI deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.podSecurityContext</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Security context for the UI pod
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.port</td>
+			<td>int</td>
+			<td><pre lang="json">
+3000
+</pre>
+</td>
+			<td>Port for the UI deployment</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.readinessProbe</td>
+			<td>object</td>
+			<td><pre lang="">
+tcpSocket:<br>  port: ui<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+</pre>
+</td>
+			<td>Readiness probe
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.replicaCount</td>
+			<td>int</td>
+			<td><pre lang="json">
+1
+</pre>
+</td>
+			<td>Replica count for the UI deployment</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.resources</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Resources for the UI deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.securityContext</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Security context for the UI container
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.startupProbe</td>
+			<td>object</td>
+			<td><pre lang="">
+tcpSocket:<br>  port: ui<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+</pre>
+</td>
+			<td>Startup probe
+
+[Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.tolerations</td>
+			<td>array</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Tolerations for the UI deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+</td>
+		</tr>
+		<tr>
+			<td>ui.deployment.updateStrategy</td>
+			<td>object</td>
+			<td><pre lang="">
+not set
+</pre>
+</td>
+			<td>Update strategy for the deployment
+
+[Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)
+</td>
+		</tr>
+		<tr>
+			<td>ui.enabled</td>
+			<td>bool</td>
+			<td><pre lang="json">
+true
+</pre>
+</td>
+			<td>Enable the UI</td>
+		</tr>
+		<tr>
+			<td>ui.proxyApiRequests</td>
+			<td>bool</td>
+			<td><pre lang="json">
+null
+</pre>
+</td>
+			<td>Enable proxy API requests
+
+If set to true, the UI will proxy API requests to the server.
+It will only accept requests from the server with the host header `localhost`.
+For production deployment with a load balancer that routes traffic to the UI and server, set this to false.
+</td>
+		</tr>
+		<tr>
+			<td>ui.serverUrl</td>
+			<td>tpl/string</td>
+			<td><pre lang="">
+http://{{ include "unitycatalog.server.fullname" . }}:{{ .Values.server.service.port }}
+</pre>
+</td>
+			<td>Server URL for the UI to connect to
+
+The server URL is used by the UI to connect to the server.
+The default value is set to the server service URL.
+</td>
+		</tr>
+		<tr>
+			<td>ui.service.port</td>
+			<td>int</td>
+			<td><pre lang="json">
+3000
+</pre>
+</td>
+			<td>Service port for the UI</td>
+		</tr>
+		<tr>
+			<td>ui.service.type</td>
+			<td>string</td>
+			<td><pre lang="json">
+"ClusterIP"
+</pre>
+</td>
+			<td>Service type for the UI</td>
+		</tr>
+	</tbody>
+</table>
+
+----------------------------------------------
+Autogenerated from chart metadata using [helm-docs v1.14.2](https://github.com/norwoodj/helm-docs/releases/v1.14.2)

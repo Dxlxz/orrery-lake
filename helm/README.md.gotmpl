@@ -1,0 +1,61 @@
+{{ template "chart.header" . }}
+{{ template "chart.deprecationWarning" . }}
+
+This chart deploys [Unity Catalog](https://github.com/Dxlxz/orrery-lake) on a Kubernetes cluster
+using the [Helm](https://github.com/helm/helm) package manager.
+
+## Prerequisites
+- Kubernetes 1.20+ cluster
+- Helm 3.8+
+
+## Features
+- Deploys Unity Catalog server and UI
+- Supports OAuth authentication
+- Supports file H2DB, PostgreSQL and MySQL as a database
+- Customizable configuration for server and UI using Helm values
+
+## Installing the Chart
+Starting with 0.8.0, each Unity Catalog release publishes this chart to Docker Hub, with the same version as the release.
+To install release X.Y.Z with the release name `unitycatalog`:
+
+```sh
+helm install unitycatalog oci://registry-1.docker.io/Dxlxz/orrery-lake-chart --version X.Y.Z
+```
+
+Chart version X.Y.Z runs the server image `Dxlxz/orrery-lake:vX.Y.Z` and the UI image `Dxlxz/orrery-lake-ui:vX.Y.Z`.
+
+## Uninstalling the Chart
+To uninstall the `unitycatalog` chart:
+
+```sh
+helm uninstall unitycatalog
+```
+
+The command deletes the release. It keeps the H2 database PersistentVolumeClaim and the token signing key Secret;
+delete both to remove the data.
+
+## Audit records
+Turn on [audit records](https://github.com/Dxlxz/orrery-lake/blob/main/docs/server/configuration.md#audit-records)
+to write one JSON line per issued storage credential, permission change and queued storage cleanup
+to `/home/unitycatalog/etc/logs/audit.log`; the chart already configures the `audit` logger. The
+file is lost when the pod restarts, so ship it continuously (for example from a sidecar in
+`server.deployment.extraContainers`) or keep the directory on a volume:
+
+```yaml
+server:
+  config:
+    extraProperties:
+      server.audit.sink: io.unitycatalog.server.audit.FileAuditSink
+```
+
+## Configuration
+The following table lists the configurable parameters of the Unity Catalog chart and their default values.
+
+> **Note**
+>
+> Auth integration in UI works only with Google OAuth provider and
+> it does not work with UC versions 0.2.1 and below.
+
+{{ template "chart.valuesSectionHtml" . }}
+
+{{ template "helm-docs.versionFooter" . }}

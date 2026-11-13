@@ -1,0 +1,127 @@
+package io.unitycatalog.server.service;
+
+import static io.unitycatalog.server.model.SecurableType.CATALOG;
+import static io.unitycatalog.server.model.SecurableType.FUNCTION;
+import static io.unitycatalog.server.model.SecurableType.METASTORE;
+import static io.unitycatalog.server.model.SecurableType.SCHEMA;
+
+import com.linecorp.armeria.common.HttpResponse;
+import com.linecorp.armeria.common.HttpStatus;
+import com.linecorp.armeria.server.annotation.Delete;
+import com.linecorp.armeria.server.annotation.Get;
+import com.linecorp.armeria.server.annotation.Param;
+import com.linecorp.armeria.server.annotation.Post;
+import io.unitycatalog.server.auth.AuthorizeExpressions;
+import io.unitycatalog.server.auth.UnityCatalogAuthorizer;
+import io.unitycatalog.server.auth.annotation.AuthorizeExpression;
+import io.unitycatalog.server.auth.annotation.AuthorizeResourceKey;
+import io.unitycatalog.server.auth.annotation.AuthorizeResourceKeys;
+import io.unitycatalog.server.auth.annotation.ResponseAuthorizeFilter;
+import io.unitycatalog.server.auth.decorator.BrowseOnlyConverter;
+import io.unitycatalog.server.model.CreateFunctionRequest;
+import io.unitycatalog.server.model.FunctionInfo;
+import io.unitycatalog.server.model.ListFunctionsResponse;
+import io.unitycatalog.server.model.SchemaInfo;
+import io.unitycatalog.server.model.SecurableType;
+import io.unitycatalog.server.persist.CatalogRepository;
+import io.unitycatalog.server.persist.FunctionRepository;
+import io.unitycatalog.server.persist.MetastoreRepository;
+import io.unitycatalog.server.persist.Repositories;
+import io.unitycatalog.server.persist.SchemaRepository;
+import io.unitycatalog.server.utils.ServerProperties;
+import java.util.Optional;
+import lombok.SneakyThrows;
+
+public class FunctionService extends AuthorizedService implements UnityCatalogRestService {
+
+  private final FunctionRepository functionRepository;
+  private final SchemaRepository schemaRepository;
+  private final CatalogRepository catalogRepository;
+  private final MetastoreRepository metastoreRepository;
+
+  @SneakyThrows
+  public FunctionService(
+      UnityCatalogAuthorizer authorizer,
+      Repositories repositories,
+      ServerProperties serverProperties) {
+    super(authorizer, repositories, serverProperties);
+    this.catalogRepository = repositories.getCatalogRepository();
+    this.schemaRepository = repositories.getSchemaRepository();
+    this.functionRepository = repositories.getFunctionRepository();
+    this.metastoreRepository = repositories.getMetastoreRepository();
+  }
+
+  @Post("")
+  @AuthorizeExpression(
+      """
+      #authorizeAny(#principal, #catalog, OWNER, USE_CATALOG) &&
+          (#authorize(#principal, #schema, OWNER) ||
+            #authorizeAll(#principal, #schema, USE_SCHEMA, CREATE_FUNCTION))
+      """)
+  @AuthorizeResourceKey(METASTORE)
+  public HttpResponse createFunction(
+      @AuthorizeResourceKeys({
+            @AuthorizeResourceKey(value = CATALOG, key = "function_info.catalog_name"),
+            @AuthorizeResourceKey(value = SCHEMA, key = "function_info.schema_name")
+          })
+          CreateFunctionRequest createFunctionRequest) {
+    FunctionInfo functionInfo = functionRepository.createFunction(createFunctionRequest);
+
+    String catalogName = functionInfo.getCatalogName();
+    String schemaName = functionInfo.getSchemaName();
+    SchemaInfo schemaInfo = schemaRepository.getSchema(catalogName + "." + schemaName);
+    initializeHierarchicalAuthorization(functionInfo.getFunctionId(), schemaInfo.getSchemaId());
+
+    return HttpResponse.ofJson(functionInfo);
+  }
+
+  @Get("")
+  @AuthorizeExpression(AuthorizeExpressions.GET_FUNCTION)
+  @ResponseAuthorizeFilter(browse = AuthorizeExpressions.BROWSE_CATALOG)
+  @AuthorizeResourceKey(METASTORE)
+  public HttpResponse listFunctions(
+      @Param("catalog_name") @AuthorizeResourceKey(CATALOG) String catalogName,
+      @Param("schema_name") @AuthorizeResourceKey(SCHEMA) String schemaName,
+      @Param("max_results") Optional<Integer> maxResults,
+      @Param("page_token") Optional<String> pageToken,
+      @Param("include_browse") Optional<Boolean> includeBrowse) {
+    ListFunctionsResponse listFunctionsResponse =
+        functionRepository.listFunctions(catalogName, schemaName, maxResults, pageToken);
+    applyResponseFilter(
+        SecurableType.FUNCTION,
+        listFunctionsResponse.getFunctions(),
+        BrowseOnlyConverter::toBrowseOnly);
+    return HttpResponse.ofJson(listFunctionsResponse);
+  }
+
+  @Get("/{name}")
+  @AuthorizeResourceKey(METASTORE)
+  @AuthorizeExpression(AuthorizeExpressions.GET_FUNCTION)
+  @ResponseAuthorizeFilter(isList = false, browse = AuthorizeExpressions.BROWSE_CATALOG)
+  public HttpResponse getFunction(
+      @Param("name") @AuthorizeResourceKey(FUNCTION) String name,
+      @Param("include_browse") Optional<Boolean> includeBrowse) {
+    return HttpResponse.ofJson(
+        applyGetResponseFilter(
+            SecurableType.FUNCTION,
+            functionRepository.getFunction(name),
+            BrowseOnlyConverter::toBrowseOnly));
+  }
+
+  @Delete("/{name}")
+  @AuthorizeResourceKey(METASTORE)
+  @AuthorizeExpression(AuthorizeExpressions.UPDATE_FUNCTION)
+  public HttpResponse deleteFunction(
+      @Param("name") @AuthorizeResourceKey(FUNCTION) String name,
+      @Param("force") Optional<Boolean> force) {
+    FunctionInfo functionInfo = functionRepository.getFunction(name);
+    functionRepository.deleteFunction(name, force.orElse(false));
+
+    String catalogName = functionInfo.getCatalogName();
+    String schemaName = functionInfo.getSchemaName();
+    SchemaInfo schemaInfo = schemaRepository.getSchema(catalogName + "." + schemaName);
+    removeHierarchicalAuthorizations(functionInfo.getFunctionId(), schemaInfo.getSchemaId());
+
+    return HttpResponse.of(HttpStatus.OK);
+  }
+}

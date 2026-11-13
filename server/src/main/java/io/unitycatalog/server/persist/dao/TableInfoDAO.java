@@ -1,0 +1,174 @@
+package io.unitycatalog.server.persist.dao;
+
+import io.unitycatalog.server.model.DataSourceFormat;
+import io.unitycatalog.server.model.TableInfo;
+import io.unitycatalog.server.model.TableType;
+import io.unitycatalog.server.utils.NormalizedURL;
+import jakarta.persistence.CascadeType;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.Index;
+import jakarta.persistence.Lob;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.OrderBy;
+import jakarta.persistence.Table;
+import java.util.Date;
+import java.util.List;
+import java.util.UUID;
+import lombok.AllArgsConstructor;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+import lombok.experimental.SuperBuilder;
+import org.hibernate.annotations.BatchSize;
+
+// Hibernate annotations
+@Entity
+@Table(
+    name = "uc_tables",
+    indexes = {
+      @Index(name = "idx_name", columnList = "name"),
+    })
+// Lombok annotations
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@EqualsAndHashCode(callSuper = true)
+@SuperBuilder
+public class TableInfoDAO extends IdentifiableDAO {
+  @Column(name = "schema_id")
+  private UUID schemaId;
+
+  @Column(name = "type")
+  private String type;
+
+  @Column(name = "owner")
+  private String owner;
+
+  @Column(name = "created_at")
+  private Date createdAt;
+
+  @Column(name = "created_by")
+  private String createdBy;
+
+  @Column(name = "updated_at")
+  private Date updatedAt;
+
+  @Column(name = "updated_by")
+  private String updatedBy;
+
+  @Column(name = "data_source_format")
+  private String dataSourceFormat;
+
+  @Column(name = "comment", length = 65535)
+  private String comment;
+
+  @Column(name = "url", length = 2048)
+  private String url;
+
+  @Column(name = "column_count")
+  private Integer columnCount;
+
+  @OneToMany(
+      mappedBy = "table",
+      cascade = CascadeType.ALL,
+      orphanRemoval = true,
+      fetch = FetchType.LAZY)
+  // listTables reads the columns of a whole page of tables; initialize them in batches instead of
+  // one query per table.
+  @BatchSize(size = 100)
+  // Without an explicit order the rows come back in whatever order PostgreSQL returns them, which
+  // drifts from ordinal_position once a table's column rows are rewritten. Clients bind columns by
+  // position (Spark pairs a view's columns with its persisted query-output names), so always
+  // return them in declared order.
+  @OrderBy("ordinalPosition ASC")
+  private List<ColumnInfoDAO> columns;
+
+  @Lob
+  @Column(name = "view_definition", length = 16777215)
+  private String viewDefinition;
+
+  /**
+   * Iceberg metadata pointer for either a Delta UniForm projection or a native Iceberg table. A
+   * non-null value does NOT imply a Delta/UniForm table. The owning format is distinguished by
+   * {@link #dataSourceFormat} -- Delta is authoritative for UniForm, Iceberg is authoritative for
+   * native Iceberg tables -- so always read this field together with {@code dataSourceFormat},
+   * never on its own.
+   *
+   * <p>The database column keeps its legacy {@code uniform_iceberg_metadata_location} name, which
+   * predates native Iceberg support and is a misnomer; the Java field is named for what it actually
+   * holds.
+   */
+  @Column(name = "uniform_iceberg_metadata_location", length = 65535)
+  private String icebergMetadataLocation;
+
+  @Column(name = "uniform_iceberg_converted_delta_version")
+  private Long uniformIcebergConvertedDeltaVersion;
+
+  @Column(name = "uniform_iceberg_converted_delta_timestamp")
+  private Date uniformIcebergConvertedDeltaTimestamp;
+
+  public static TableInfoDAO from(TableInfo tableInfo, UUID schemaId) {
+    return TableInfoDAO.builder()
+        .id(UUID.fromString(tableInfo.getTableId()))
+        .name(tableInfo.getName())
+        .comment(tableInfo.getComment())
+        .owner(tableInfo.getOwner())
+        .createdAt(
+            tableInfo.getCreatedAt() != null ? new Date(tableInfo.getCreatedAt()) : new Date())
+        .createdBy(tableInfo.getCreatedBy())
+        .updatedAt(tableInfo.getUpdatedAt() != null ? new Date(tableInfo.getUpdatedAt()) : null)
+        .updatedBy(tableInfo.getUpdatedBy())
+        .columnCount(tableInfo.getColumns() != null ? tableInfo.getColumns().size() : 0)
+        .type(tableInfo.getTableType().toString())
+        .dataSourceFormat(
+            tableInfo.getDataSourceFormat() != null
+                ? tableInfo.getDataSourceFormat().toString()
+                : null)
+        .url(tableInfo.getStorageLocation())
+        .viewDefinition(tableInfo.getViewDefinition())
+        .columns(ColumnInfoDAO.fromList(tableInfo.getColumns()))
+        .schemaId(schemaId)
+        .build();
+  }
+
+  public TableInfo toTableInfo(boolean fetchColumns, String catalogName, String schemaName) {
+    TableInfo tableInfo =
+        new TableInfo()
+            .tableId(getId().toString())
+            .name(getName())
+            .catalogName(catalogName)
+            .schemaName(schemaName)
+            .tableType(TableType.valueOf(type))
+            .dataSourceFormat(
+                dataSourceFormat != null ? DataSourceFormat.valueOf(dataSourceFormat) : null)
+            .storageLocation(url != null ? NormalizedURL.normalize(url) : null)
+            .viewDefinition(viewDefinition)
+            .comment(comment)
+            .owner(owner)
+            .createdAt(createdAt != null ? createdAt.getTime() : null)
+            .createdBy(createdBy)
+            .updatedAt(updatedAt != null ? updatedAt.getTime() : null)
+            .updatedBy(updatedBy);
+    if (fetchColumns) {
+      tableInfo.columns(ColumnInfoDAO.toList(columns));
+    }
+    return tableInfo;
+  }
+
+  /**
+   * Update the UniForm Iceberg metadata fields as an atomic triple. All three fields are written
+   * together; callers must supply the validated, normalized values produced by {@code
+   * DeltaUniformUtils.UniformIcebergFields} so the DAO cannot drift on which fields are touched or
+   * how the location is normalized. Shared between createTable on Delta REST and addCommit.
+   */
+  public void updateUniformIcebergMetadata(
+      NormalizedURL metadataLocation, long convertedDeltaVersion, long convertedDeltaTimestampMs) {
+    setIcebergMetadataLocation(metadataLocation.toString());
+    setUniformIcebergConvertedDeltaVersion(convertedDeltaVersion);
+    setUniformIcebergConvertedDeltaTimestamp(new Date(convertedDeltaTimestampMs));
+  }
+}

@@ -1,0 +1,671 @@
+package io.unitycatalog.server;
+
+import static io.unitycatalog.server.security.SecurityContext.Issuers.INTERNAL;
+
+import com.linecorp.armeria.common.util.BlockingTaskExecutor;
+import com.linecorp.armeria.server.Server;
+import com.linecorp.armeria.server.ServerListener;
+import com.linecorp.armeria.server.healthcheck.HealthCheckService;
+import com.linecorp.armeria.server.prometheus.PrometheusExpositionService;
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry;
+import io.unitycatalog.server.audit.Auditor;
+import io.unitycatalog.server.auth.AllowingAuthorizer;
+import io.unitycatalog.server.auth.JCasbinAuthorizer;
+import io.unitycatalog.server.auth.OpaAuthorizer;
+import io.unitycatalog.server.auth.UnityCatalogAuthorizer;
+import io.unitycatalog.server.auth.decorator.UnityAccessDecorator;
+import io.unitycatalog.server.auth.decorator.UnityAccessUtil;
+import io.unitycatalog.server.cleanup.StorageCleanupWorker;
+import io.unitycatalog.server.exception.BaseException;
+import io.unitycatalog.server.exception.BaseExceptionHandler;
+import io.unitycatalog.server.exception.ErrorCode;
+import io.unitycatalog.server.migrate.SchemaMigrator;
+import io.unitycatalog.server.observability.DbReadinessChecker;
+import io.unitycatalog.server.observability.MetricsRegistries;
+import io.unitycatalog.server.observability.UnityCatalogMetrics;
+import io.unitycatalog.server.persist.Repositories;
+import io.unitycatalog.server.persist.utils.FileOperations;
+import io.unitycatalog.server.persist.utils.HibernateConfigurator;
+import io.unitycatalog.server.security.SecurityConfiguration;
+import io.unitycatalog.server.security.SecurityContext;
+import io.unitycatalog.server.service.AuthDecorator;
+import io.unitycatalog.server.service.AuthService;
+import io.unitycatalog.server.service.CatalogService;
+import io.unitycatalog.server.service.CredentialService;
+import io.unitycatalog.server.service.DeltaCommitsService;
+import io.unitycatalog.server.service.ExternalLocationService;
+import io.unitycatalog.server.service.FunctionService;
+import io.unitycatalog.server.service.IcebergRestCatalogService;
+import io.unitycatalog.server.service.MetastoreService;
+import io.unitycatalog.server.service.ModelService;
+import io.unitycatalog.server.service.PermissionService;
+import io.unitycatalog.server.service.SchemaService;
+import io.unitycatalog.server.service.Scim2SelfService;
+import io.unitycatalog.server.service.Scim2UserService;
+import io.unitycatalog.server.service.StagingTableService;
+import io.unitycatalog.server.service.TableService;
+import io.unitycatalog.server.service.TemporaryModelVersionCredentialsService;
+import io.unitycatalog.server.service.TemporaryPathCredentialsService;
+import io.unitycatalog.server.service.TemporaryTableCredentialsService;
+import io.unitycatalog.server.service.TemporaryVolumeCredentialsService;
+import io.unitycatalog.server.service.VolumeService;
+import io.unitycatalog.server.service.credential.CloudCredentialVendor;
+import io.unitycatalog.server.service.credential.StorageCredentialVendor;
+import io.unitycatalog.server.service.delta.DeltaApiService;
+import io.unitycatalog.server.service.iceberg.MetadataService;
+import io.unitycatalog.server.service.iceberg.TableConfigService;
+import io.unitycatalog.server.utils.OptionParser;
+import io.unitycatalog.server.utils.ServerProperties;
+import io.unitycatalog.server.utils.VersionUtils;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class UnityCatalogServer implements AutoCloseable {
+  private static final Logger LOGGER = LoggerFactory.getLogger(UnityCatalogServer.class);
+  private static final String BASE_PATH = "/api/2.1/unity-catalog/";
+  private static final String CONTROL_PATH = "/api/1.0/unity-control/";
+  private static final int DEFAULT_PORT = 8080;
+  public static final String SERVER_PROPERTIES_FILE = "etc/conf/server.properties";
+  private final Server server;
+  private final SecurityContext securityContext;
+  private final HibernateConfigurator hibernateConfigurator;
+  private final BlockingTaskExecutor blockingTaskExecutor;
+
+  /** How long tasks interrupted at the end of the shutdown drain get to stop. */
+  private static final Duration INTERRUPTED_TASK_GRACE = Duration.ofMillis(500);
+
+  private final Duration shutdownTimeout;
+
+  /** True when this server built the configurator itself and must therefore close it. */
+  private final boolean ownsHibernateConfigurator;
+
+  /** Set during {@link #initializeServer}; may be null if construction fails early. */
+  private UnityCatalogAuthorizer authorizer;
+
+  /** Set during {@link #initializeServer}; null when auditing is off or not yet set up. */
+  private Auditor auditor;
+
+  /** Set during {@link #initializeServer}; may be null if construction fails early. */
+  private StorageCleanupWorker cleanupWorker;
+
+  /**
+   * Metrics registry owned by this server instance; set during {@link #initializeServer}. Closed on
+   * shutdown to release the JVM/GC metric listeners it binds (may be null if construction fails
+   * early).
+   */
+  private MetricsRegistries.PrometheusMetrics metrics;
+
+  static {
+    System.setProperty("log4j.configurationFile", "etc/conf/server.log4j2.properties");
+    Configurator.initialize(null, "etc/conf/server.log4j2.properties");
+  }
+
+  private UnityCatalogServer(UnityCatalogServer.Builder unityCatalogServerBuilder) {
+    setDefaults(unityCatalogServerBuilder);
+    unityCatalogServerBuilder.serverProperties.validateProperties();
+    this.shutdownTimeout = unityCatalogServerBuilder.serverProperties.getShutdownTimeout();
+    Path configurationFolder = unityCatalogServerBuilder.configurationFolder;
+    SecurityConfiguration securityConfiguration = new SecurityConfiguration(configurationFolder);
+
+    this.securityContext =
+        new SecurityContext(configurationFolder, securityConfiguration, "server", INTERNAL);
+    // An injected configurator stays the caller's to close; only a self-built one is ours.
+    this.ownsHibernateConfigurator = unityCatalogServerBuilder.hibernateConfigurator == null;
+    this.hibernateConfigurator =
+        ownsHibernateConfigurator
+            ? new HibernateConfigurator(unityCatalogServerBuilder.serverProperties)
+            : unityCatalogServerBuilder.hibernateConfigurator;
+    BlockingTaskExecutor createdBlockingTaskExecutor = null;
+    try {
+      createdBlockingTaskExecutor =
+          BlockingTaskExecutor.builder()
+              .numThreads(hibernateConfigurator.getDataSource().getMaximumPoolSize())
+              .threadNamePrefix("unity-catalog-blocking")
+              .build();
+      this.blockingTaskExecutor = createdBlockingTaskExecutor;
+      this.server = initializeServer(unityCatalogServerBuilder);
+    } catch (Throwable t) {
+      // Construction failed after the SessionFactory was built; close it so a failed boot does
+      // not leak its connection pool. Errors matter as much as RuntimeExceptions here: a
+      // NoClassDefFoundError out of initializeServer() would leak the pool just the same.
+      closeQuietly(metrics, t, "the metrics registry");
+      closeQuietly(cleanupWorker, t, "the storage cleanup worker");
+      closeQuietly(authorizer instanceof AutoCloseable c ? c : null, t, "the authorizer");
+      closeBlockingTaskExecutor(createdBlockingTaskExecutor, shutdownTimeout, t);
+      closeQuietly(auditor, t, "the audit sink");
+      closeOwnedSessionFactory(t);
+      throw t;
+    }
+  }
+
+  /**
+   * Shuts down the server-owned blocking executor and waits up to {@code timeout}. Tasks still
+   * running after that are interrupted and given a moment to stop; then shutdown continues, so a
+   * wedged JDBC call cannot hold the process until the orchestrator kills it.
+   */
+  private static void closeBlockingTaskExecutor(
+      BlockingTaskExecutor executor, Duration timeout, Throwable primaryFailure) {
+    if (executor == null) {
+      return;
+    }
+    boolean interrupted = false;
+    try {
+      executor.shutdown();
+      try {
+        if (!executor.awaitTermination(timeout.toNanos(), TimeUnit.NANOSECONDS)) {
+          // A task blocked on a lock, a sleep or interruptible I/O stops on the interrupt, before
+          // the resources it uses are closed. One that ignores interrupts can still be running
+          // when they close, and keeps running until the process exits.
+          LOGGER.warn(
+              "Blocking task executor did not stop within {}; interrupting its tasks", timeout);
+          executor.shutdownNow();
+          if (!executor.awaitTermination(INTERRUPTED_TASK_GRACE.toNanos(), TimeUnit.NANOSECONDS)) {
+            LOGGER.warn("Blocking tasks still running after the interrupt; continuing shutdown");
+          }
+        }
+      } catch (InterruptedException ignored) {
+        interrupted = true;
+      }
+    } catch (Throwable closeFailure) {
+      if (primaryFailure != null) {
+        primaryFailure.addSuppressed(closeFailure);
+      } else {
+        LOGGER.warn("Failed to close the blocking task executor", closeFailure);
+      }
+    } finally {
+      if (interrupted) {
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+
+  /**
+   * Closes the Hibernate configurator if this server created it, leaving an injected one to its
+   * owner. A failure to close is attached to {@code primaryFailure} so it cannot mask the original
+   * error.
+   */
+  private void closeOwnedSessionFactory(Throwable primaryFailure) {
+    if (!ownsHibernateConfigurator) {
+      return;
+    }
+    try {
+      hibernateConfigurator.close();
+    } catch (Throwable closeFailure) {
+      primaryFailure.addSuppressed(closeFailure);
+    }
+  }
+
+  /**
+   * Closes a cleanup resource without letting its own failure abort the caller. The failure is
+   * attached to {@code primaryFailure} when there is one, otherwise logged. Catches {@link
+   * Throwable} so an {@link Error} cannot break a cleanup chain that still has resources (notably
+   * the SessionFactory) left to release.
+   */
+  private void closeQuietly(AutoCloseable resource, Throwable primaryFailure, String description) {
+    if (resource == null) {
+      return;
+    }
+    try {
+      resource.close();
+    } catch (Throwable closeFailure) {
+      if (primaryFailure != null) {
+        primaryFailure.addSuppressed(closeFailure);
+      } else {
+        LOGGER.warn("Failed to close {}", description, closeFailure);
+      }
+    }
+  }
+
+  private void setDefaults(UnityCatalogServer.Builder unityCatalogServerBuilder) {
+    if (unityCatalogServerBuilder.port == 0) {
+      unityCatalogServerBuilder.port(DEFAULT_PORT);
+    }
+    if (unityCatalogServerBuilder.serverProperties == null) {
+      unityCatalogServerBuilder.serverProperties(new ServerProperties(SERVER_PROPERTIES_FILE));
+    }
+  }
+
+  private Server initializeServer(UnityCatalogServer.Builder unityCatalogServerBuilder) {
+    // One blocking thread per JDBC connection, as backpressure. Every annotated handler runs on
+    // this pool, so it also caps concurrent handlers that hold no connection, such as cloud
+    // credential vending.
+    ArmeriaServerBuilder armeriaServerBuilder =
+        new ArmeriaServerBuilder(
+            unityCatalogServerBuilder.port,
+            BASE_PATH,
+            CONTROL_PATH,
+            unityCatalogServerBuilder.serverProperties,
+            blockingTaskExecutor);
+
+    UnityCatalogMetrics domainMetrics = UnityCatalogMetrics.noop();
+    if (unityCatalogServerBuilder.observabilityPort != null) {
+      domainMetrics =
+          initializeObservability(
+              armeriaServerBuilder,
+              unityCatalogServerBuilder.observabilityPort,
+              unityCatalogServerBuilder.serverProperties);
+    }
+    // Created here, before the repositories, so a failed start closes the sink.
+    Optional<Auditor> audit = Auditor.fromProperties(unityCatalogServerBuilder.serverProperties);
+    auditor = audit.orElse(null);
+    Repositories repositories =
+        new Repositories(
+            hibernateConfigurator.getSessionFactory(),
+            unityCatalogServerBuilder.serverProperties,
+            unityCatalogServerBuilder.cloudCredentialVendor,
+            unityCatalogServerBuilder.fileOperationsDecorator,
+            domainMetrics,
+            audit);
+    // Init metastore
+    repositories.getMetastoreRepository().initMetastoreIfNeeded();
+    // Init authorizer
+    authorizer =
+        initializeAuthorizer(
+            unityCatalogServerBuilder.serverProperties, hibernateConfigurator, repositories);
+    // Configure error response stack traces
+    BaseExceptionHandler.setIncludeStackTrace(
+        unityCatalogServerBuilder.serverProperties.isIncludeStackTraceInError());
+    // Init services
+    addApiServices(armeriaServerBuilder, unityCatalogServerBuilder, authorizer, repositories);
+    // Init security decorators
+    addSecurityDecorators(
+        armeriaServerBuilder, unityCatalogServerBuilder.serverProperties, authorizer, repositories);
+    // Armeria runs decorators in reverse registration order. Register metrics last so it wraps
+    // authentication and authorization and records rejected requests as well.
+    if (metrics != null) {
+      armeriaServerBuilder.meterRegistry(metrics.registry());
+    }
+    initializeCleanup(unityCatalogServerBuilder.serverProperties, repositories, domainMetrics);
+
+    return armeriaServerBuilder.build();
+  }
+
+  private UnityCatalogMetrics initializeObservability(
+      ArmeriaServerBuilder armeriaServerBuilder,
+      int observabilityPort,
+      ServerProperties serverProperties) {
+    armeriaServerBuilder.observabilityPort(observabilityPort);
+    // This server owns the registry and releases its JVM/GC binders on close().
+    metrics = MetricsRegistries.createPrometheus();
+    PrometheusMeterRegistry meterRegistry = metrics.registry();
+    armeriaServerBuilder.observabilityService(
+        "/metrics", PrometheusExpositionService.of(meterRegistry.getPrometheusRegistry()));
+
+    // Observability: unauthenticated liveness probe on the observability port. HealthCheckService
+    // .of() has no checkers, so it is healthy while the process is serving and never touches the
+    // DB. Like /readyz it flips to 503 once graceful shutdown begins (HealthCheckService drains on
+    // stop). Kubelet-style probes target the observability port directly.
+    armeriaServerBuilder.observabilityService("/livez", HealthCheckService.of());
+
+    // Readiness: 503 until the DB is reachable. The check runs on a background scheduler
+    // (never on the request path); start()/close() are tied to the Armeria server lifecycle so
+    // the synchronous initial probe runs on the startup thread and the scheduler is torn down on
+    // shutdown. HealthCheckService also flips these probes to 503 during graceful shutdown.
+    DbReadinessChecker readinessChecker =
+        DbReadinessChecker.forSessionFactory(
+            hibernateConfigurator.getSessionFactory(),
+            serverProperties.getReadinessProbeInterval(),
+            serverProperties.getReadinessDbTimeout());
+    armeriaServerBuilder.observabilityService(
+        "/readyz", HealthCheckService.builder().checkers(readinessChecker.healthChecker()).build());
+    armeriaServerBuilder.serverListener(
+        ServerListener.builder()
+            .whenStarting(server -> readinessChecker.start())
+            .whenStopped(server -> readinessChecker.close())
+            .build());
+    return new UnityCatalogMetrics(meterRegistry);
+  }
+
+  private void initializeCleanup(
+      ServerProperties serverProperties,
+      Repositories repositories,
+      UnityCatalogMetrics domainMetrics) {
+    cleanupWorker =
+        new StorageCleanupWorker(
+            repositories.getStorageCleanupTaskRepository(),
+            repositories.getFileOperations(),
+            Clock.systemUTC(),
+            serverProperties,
+            domainMetrics);
+  }
+
+  private UnityCatalogAuthorizer initializeAuthorizer(
+      ServerProperties serverProperties,
+      HibernateConfigurator hibernateConfigurator,
+      Repositories repositories) {
+    if (serverProperties.isAuthorizationEnabled()) {
+      try {
+        LOGGER.info("Initializing JCasbinAuthorizer...");
+        JCasbinAuthorizer authorizer =
+            new JCasbinAuthorizer(hibernateConfigurator, serverProperties);
+        try {
+          UnityCatalogAuthorizer backend;
+          if (serverProperties.isOpaAuthorizationEnabled()) {
+            LOGGER.info("Using OPA for authorization decisions.");
+            backend =
+                new OpaAuthorizer(
+                    authorizer,
+                    hibernateConfigurator.getSessionFactory(),
+                    serverProperties.getOpaDecisionUrl(),
+                    serverProperties.getOpaResponseTimeout());
+          } else {
+            backend = authorizer;
+          }
+          UnityCatalogAuthorizer effective =
+              Optional.ofNullable(auditor).map(a -> a.wrap(backend)).orElse(backend);
+          new UnityAccessUtil(repositories).initializeAdmin(effective);
+          return effective;
+        } catch (Exception e) {
+          authorizer.close();
+          throw e;
+        }
+      } catch (Exception e) {
+        throw new BaseException(ErrorCode.INTERNAL, "Problem initializing authorizer.", e);
+      }
+    } else {
+      LOGGER.info("Authorization disabled. Using AllowingAuthorizer.");
+      return new AllowingAuthorizer();
+    }
+  }
+
+  private void addApiServices(
+      ArmeriaServerBuilder armeriaServerBuilder,
+      UnityCatalogServer.Builder unityCatalogServerBuilder,
+      UnityCatalogAuthorizer authorizer,
+      Repositories repositories) {
+    LOGGER.info("Adding Unity Catalog API services...");
+    ServerProperties serverProperties = unityCatalogServerBuilder.serverProperties;
+    // The credential/file-IO chain is built and owned by Repositories (so repositories can read
+    // table storage); reuse those instances here rather than rebuilding them.
+    StorageCredentialVendor storageCredentialVendor = repositories.getStorageCredentialVendor();
+    FileOperations fileOperations = repositories.getFileOperations();
+
+    SchemaService schemaService = new SchemaService(authorizer, repositories, serverProperties);
+
+    // Each annotate call registers one service. Order is not significant (Armeria routes by path
+    // specificity); relative paths are resolved against the protocol's base path ("" mounts at the
+    // base path root).
+    armeriaServerBuilder
+        .annotate("auth", new AuthService(securityContext, serverProperties, repositories))
+        .annotate("scim2/Users", new Scim2UserService(authorizer, repositories, serverProperties))
+        .annotate("scim2/Me", new Scim2SelfService(authorizer, repositories))
+        .annotate("permissions", new PermissionService(authorizer, repositories, serverProperties))
+        .annotate("catalogs", new CatalogService(authorizer, repositories, serverProperties))
+        .annotate("schemas", schemaService)
+        .annotate("volumes", new VolumeService(authorizer, repositories, serverProperties))
+        .annotate("tables", new TableService(authorizer, repositories, serverProperties))
+        .annotate(
+            "staging-tables", new StagingTableService(authorizer, repositories, serverProperties))
+        .annotate("functions", new FunctionService(authorizer, repositories, serverProperties))
+        .annotate("models", new ModelService(authorizer, repositories, serverProperties))
+        .annotate("", new MetastoreService(repositories))
+        .annotate(
+            "temporary-table-credentials",
+            new TemporaryTableCredentialsService(
+                storageCredentialVendor, repositories, serverProperties))
+        .annotate(
+            "temporary-volume-credentials",
+            new TemporaryVolumeCredentialsService(storageCredentialVendor, repositories))
+        .annotate(
+            "temporary-model-version-credentials",
+            new TemporaryModelVersionCredentialsService(storageCredentialVendor, repositories))
+        .annotate(
+            "temporary-path-credentials",
+            new TemporaryPathCredentialsService(storageCredentialVendor))
+        .annotate("credentials", new CredentialService(authorizer, repositories, serverProperties))
+        .annotate(
+            "delta/preview/commits",
+            new DeltaCommitsService(authorizer, repositories, serverProperties))
+        .annotate(
+            "external-locations",
+            new ExternalLocationService(authorizer, repositories, serverProperties));
+    addIcebergApiServices(
+        armeriaServerBuilder, authorizer, repositories, fileOperations, serverProperties);
+    addDeltaApiServices(
+        armeriaServerBuilder, authorizer, repositories, serverProperties, storageCredentialVendor);
+  }
+
+  private void addIcebergApiServices(
+      ArmeriaServerBuilder armeriaServerBuilder,
+      UnityCatalogAuthorizer authorizer,
+      Repositories repositories,
+      FileOperations fileOperations,
+      ServerProperties serverProperties) {
+    LOGGER.info("Adding Iceberg services...");
+
+    // Add support for Iceberg REST APIs
+    MetadataService metadataService = new MetadataService(fileOperations);
+    TableConfigService tableConfigService = new TableConfigService(fileOperations);
+
+    armeriaServerBuilder.annotate(
+        ArmeriaServerBuilder.ICEBERG_RELATIVE_PATH,
+        new IcebergRestCatalogService(
+            authorizer, tableConfigService, metadataService, repositories, serverProperties));
+  }
+
+  private void addDeltaApiServices(
+      ArmeriaServerBuilder armeriaServerBuilder,
+      UnityCatalogAuthorizer authorizer,
+      Repositories repositories,
+      ServerProperties serverProperties,
+      StorageCredentialVendor storageCredentialVendor) {
+    LOGGER.info("Adding UC Delta API services...");
+    DeltaApiService deltaApiService =
+        new DeltaApiService(authorizer, repositories, serverProperties, storageCredentialVendor);
+    armeriaServerBuilder.annotate("", deltaApiService);
+  }
+
+  private void addSecurityDecorators(
+      ArmeriaServerBuilder armeriaServerBuilder,
+      ServerProperties serverProperties,
+      UnityCatalogAuthorizer authorizer,
+      Repositories repositories) {
+    // TODO: eventually might want to make this secure-by-default.
+    if (serverProperties.isAuthorizationEnabled()) {
+      LOGGER.info("Enabling security decorators...");
+      armeriaServerBuilder.withSecurityDecorators(
+          new UnityAccessDecorator(authorizer, repositories, serverProperties),
+          new AuthDecorator(securityContext, repositories));
+    }
+  }
+
+  public static void main(String[] args) {
+    OptionParser options = new OptionParser();
+    options.parse(args);
+    if (options.isUpgradeSchema()) {
+      int exitCode = SchemaMigrator.runCommand(Path.of("etc", "conf"), System.out);
+      LogManager.shutdown();
+      System.exit(exitCode);
+    }
+    int port = options.getPort();
+    ServerProperties serverProperties = new ServerProperties(SERVER_PROPERTIES_FILE);
+    UnityCatalogServer.Builder serverBuilder =
+        UnityCatalogServer.builder().port(port).serverProperties(serverProperties);
+    if (options.getObservabilityPort() != null) {
+      serverBuilder.observabilityPort(options.getObservabilityPort());
+    }
+    UnityCatalogServer unityCatalogServer = serverBuilder.build();
+    unityCatalogServer.printArt();
+    // A failed start, such as a port that cannot be bound or a cleanup worker that cannot start
+    // after Armeria is listening, must end the process rather than leave the pool, background
+    // threads, or a bound port open.
+    try {
+      unityCatalogServer.start();
+    } catch (RuntimeException e) {
+      LOGGER.error("Failed to start the Unity Catalog server", e);
+      try {
+        unityCatalogServer.close();
+      } finally {
+        LogManager.shutdown();
+      }
+      throw e;
+    }
+    // On SIGTERM, close() runs on Armeria's shutdown thread: it stops the storage cleanup, lets
+    // in-flight requests finish for up to server.shutdown-timeout, then closes everything else.
+    // Log4j stops last, even when close() fails (Armeria logs that failure); bin/start-uc-server
+    // turns off Log4j's own shutdown hook so it doesn't stop logging during the drain. The hook is
+    // registered after start() so that close() can't run during a start; a SIGTERM while starting
+    // exits without it.
+    unityCatalogServer
+        .server
+        .closeOnJvmShutdown(unityCatalogServer::close)
+        .whenComplete((unused, failure) -> LogManager.shutdown());
+  }
+
+  public void start() {
+    LOGGER.info("Starting Unity Catalog server...");
+    server.start().join();
+    cleanupWorker.start();
+    LOGGER.info("Unity Catalog server started.");
+  }
+
+  /** Stops background cleanup and the HTTP server. The server can then be restarted. */
+  public void stop() {
+    cleanupWorker.stop();
+    server.stop().join();
+    LOGGER.info("Unity Catalog server stopped.");
+  }
+
+  /**
+   * Stops the server and closes the Hibernate configurator it created, releasing the Hikari pool,
+   * which the Armeria shutdown does not touch and which would otherwise stay open until the JVM
+   * exits. A configurator supplied via {@link Builder#hibernateConfigurator} is left open — the
+   * caller owns its lifecycle. Unlike {@link #stop()}, the server cannot be restarted after this
+   * call: the blocking executor is shut down, and an owned factory and pool are closed. Safe to
+   * call more than once and safe to call before {@link #start()}.
+   *
+   * <p>The blocking executor is drained before anything else is closed, using the time remaining
+   * from {@code server.shutdown-timeout}, so a handler that outlived {@link #stop()} does not see a
+   * closed authorizer or cleanup worker. This is not a total shutdown deadline: other resource
+   * cleanup and Armeria's final shutdown can add time. A resource that fails to close is logged and
+   * the rest still close; only a failure from {@link #stop()} is thrown.
+   */
+  @Override
+  public void close() {
+    long deadlineNanos = System.nanoTime() + shutdownTimeout.toNanos();
+    try {
+      stop();
+    } finally {
+      // Drain first: a handler that outlived stop() may still use the resources closed below.
+      Duration remaining = Duration.ofNanos(Math.max(0, deadlineNanos - System.nanoTime()));
+      closeBlockingTaskExecutor(blockingTaskExecutor, remaining, null);
+      closeQuietly(metrics, null, "the metrics registry");
+      closeQuietly(cleanupWorker, null, "the storage cleanup worker");
+      closeQuietly(authorizer instanceof AutoCloseable c ? c : null, null, "the authorizer");
+      closeQuietly(auditor, null, "the audit sink");
+      closeQuietly(
+          ownsHibernateConfigurator ? hibernateConfigurator : null, null, "the database pool");
+    }
+  }
+
+  private void printArt() {
+    String art =
+        "################################################################### \n"
+            + "#  _    _       _ _            _____      _        _              #\n"
+            + "# | |  | |     (_) |          / ____|    | |      | |             #\n"
+            + "# | |  | |_ __  _| |_ _   _  | |     __ _| |_ __ _| | ___   __ _  #\n"
+            + "# | |  | | '_ \\| | __| | | | | |    / _` | __/ _` | |/ _ \\ / _` | #\n"
+            + "# | |__| | | | | | |_| |_| | | |___| (_| | || (_| | | (_) | (_| | #\n"
+            + "#  \\____/|_| |_|_|\\__|\\__, |  \\_____\\__,_|\\__\\__,_|_|\\___/ \\__, | #\n"
+            + "#                      __/ |                                __/ | #\n"
+            + "#                     |___/               "
+            + String.format("%15s", ("v" + VersionUtils.VERSION))
+            + "  |___/  #\n"
+            + "###################################################################\n";
+    System.out.println(art);
+  }
+
+  public static UnityCatalogServer.Builder builder() {
+    return new UnityCatalogServer.Builder();
+  }
+
+  public static class Builder {
+    private int port;
+    private Integer observabilityPort;
+    private ServerProperties serverProperties;
+    private HibernateConfigurator hibernateConfigurator;
+    private CloudCredentialVendor cloudCredentialVendor;
+    private UnaryOperator<FileOperations> fileOperationsDecorator = UnaryOperator.identity();
+    private Path configurationFolder = Path.of("etc", "conf");
+
+    private Builder() {}
+
+    public UnityCatalogServer.Builder port(int port) {
+      this.port = port;
+      return this;
+    }
+
+    /**
+     * Enables observability on the supplied port (1-65535). Observability is disabled if this
+     * method is not called.
+     */
+    public UnityCatalogServer.Builder observabilityPort(int observabilityPort) {
+      this.observabilityPort = observabilityPort;
+      return this;
+    }
+
+    public UnityCatalogServer.Builder serverProperties(ServerProperties serverProperties) {
+      this.serverProperties = serverProperties;
+      return this;
+    }
+
+    /**
+     * Uses the given {@link HibernateConfigurator} instead of creating one from the server
+     * properties. Lets tests share the server's session factory and customize the hibernate
+     * properties (e.g. run against PostgreSQL via Testcontainers). The server never closes this
+     * factory, so the caller owns its lifecycle.
+     */
+    public UnityCatalogServer.Builder hibernateConfigurator(
+        HibernateConfigurator hibernateConfigurator) {
+      this.hibernateConfigurator = hibernateConfigurator;
+      return this;
+    }
+
+    public UnityCatalogServer.Builder credentialOperations(
+        CloudCredentialVendor cloudCredentialVendor) {
+      this.cloudCredentialVendor = cloudCredentialVendor;
+      return this;
+    }
+
+    /**
+     * Decorates the {@link FileOperations} the server builds, e.g. to wrap file IO in tests. Treats
+     * {@code null} as {@link UnaryOperator#identity()}.
+     */
+    public UnityCatalogServer.Builder fileOperationsDecorator(
+        UnaryOperator<FileOperations> fileOperationsDecorator) {
+      this.fileOperationsDecorator =
+          fileOperationsDecorator != null ? fileOperationsDecorator : UnaryOperator.identity();
+      return this;
+    }
+
+    /**
+     * Sets the folder holding the signing keys, which the server creates if missing, and the {@code
+     * certs.json} and {@code token.txt} it writes when constructed. Defaults to {@code etc/conf};
+     * tests pass their own folder so concurrent servers do not share these files.
+     *
+     * <p>Only these files move: {@code server.properties}, {@code hibernate.properties} and the
+     * log4j configuration are still read from {@code etc/conf}.
+     *
+     * @param configurationFolder the folder for the signing keys, {@code certs.json} and {@code
+     *     token.txt}
+     * @return this builder
+     */
+    public UnityCatalogServer.Builder configurationFolder(Path configurationFolder) {
+      this.configurationFolder = Objects.requireNonNull(configurationFolder, "configurationFolder");
+      return this;
+    }
+
+    public UnityCatalogServer build() {
+      return new UnityCatalogServer(this);
+    }
+  }
+}

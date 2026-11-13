@@ -1,0 +1,62 @@
+# This is a CODEOWNERS file for unitycatalog
+# See https://help.github.com/articles/about-codeowners/ for more information
+
+* @tdas @dennyglee
+
+# Build
+/build.sbt @tdas @yili-db @TimothyW553
+/version.sbt @tdas @yili-db @TimothyW553
+/build/ @tdas @yili-db @TimothyW553
+/project/ @tdas @yili-db @TimothyW553
+/dev/ @tdas @yili-db @TimothyW553
+
+# GitHub Actions and Workflows
+/.github/actions/ @tdas @yili-db @TimothyW553
+/.github/workflows/ @tdas @yili-db @TimothyW553
+
+# Misc
+/.gitignore @tdas @yili-db @TimothyW553
+
+# Etc
+/etc/ @tdas @yili-db @TimothyW553
+
+# Spark Connector
+/connectors/spark/ @tdas @openinx @yili-db @TimothyW553
+
+# Hadoop Connector
+/connectors/hadoop/ @tdas @openinx @TimothyW553 @yili-db
+
+# Clients.
+/clients/ @tdas @openinx @yili-db @TimothyW553
+
+# Examples, CLI.
+/examples/ @tdas @openinx @yili-db @TimothyW553
+
+# Integration tests.
+/integration-tests/ @tdas @openinx @yili-db @TimothyW553
+
+# UC Server
+/server/ @tdas @openinx @yili-db @TimothyW553
+/server-shaded/ @tdas @openinx @yili-db @TimothyW553
+
+# Docs
+/docs/ @tdas @openinx @yili-db @TimothyW553
+/mkdocs.yml @tdas @openinx @yili-db @TimothyW553
+/README.md @tdas @yili-db @TimothyW553
+
+# UI
+/ui/ @tdas @yili-db
+/ui-new/ @yili-db @newfront @roeap @tdas
+
+# AI Integration
+/ai/ @tdas @yili-db @TimothyW553
+
+# AI Skills
+/CODE_REVIEW.md @tdas @yili-db @TimothyW553
+/AGENTS.md @tdas @yili-db @TimothyW553
+
+# Helm
+/helm/ @tdas @yili-db @TimothyW553
+
+# Helper scripts
+/bin/ @tdas @openinx @yili-db @TimothyW553

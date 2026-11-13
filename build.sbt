@@ -1,0 +1,957 @@
+import Checkstyle._
+
+import java.nio.file.Files
+import java.io.File
+import Tarball.createTarballSettings
+import sbt.{Attributed, util}
+import sbt.Keys.*
+import sbtlicensereport.license.{DepModuleInfo, LicenseCategory, LicenseInfo}
+import ReleaseSettings.*
+
+import scala.language.implicitConversions
+
+val orgName = "io.unitycatalog"
+val artifactNamePrefix = "unitycatalog"
+
+// Use Java 11 for two modules: clients and spark
+// for better Spark compatibility
+// until Spark 4 comes out with newer Java compatibility
+lazy val javacRelease11 = Seq("--release", "11")
+lazy val javacRelease17 = Seq("--release", "17")
+
+lazy val scala213 = "2.13.17"
+
+lazy val deltaVersion = sys.props.getOrElse("deltaVersion", "4.4.1")
+// Intentionally shadows CrossSparkVersions.autoImport.sparkVersion (SettingKey).
+// This String val is used for libraryDependencies coordinates; the SettingKey is
+// queryable in SBT via `show spark/sparkVersion`.
+lazy val sparkVersion = CrossSparkVersions.getSparkArtifactVersion()
+
+// Apache Snapshots resolver is in build/sbt-config/repositories (global).
+// No per-module sparkResolvers needed.
+lazy val hadoopVersion = sys.props.getOrElse("hadoopVersion", "3.4.2")
+
+// Library versions
+// When bumping Iceberg, re-check the Failsafe pin in the server dependencyOverrides: iceberg-aws
+// must not need a Failsafe API that the pinned version lacks.
+lazy val icebergVersion = "1.11.0"
+lazy val jacksonVersion = "2.18.10"
+lazy val openApiToolsJacksonBindNullableVersion = "0.2.11"
+lazy val log4jVersion = "2.26.1"
+lazy val awsSdkV1Version = "1.12.797"
+lazy val awsSdkV2Version = "2.54.18"
+lazy val armeriaVersion = "1.41.1"
+// Keep in lockstep with Armeria's Micrometer line.
+lazy val micrometerVersion = "1.17.0"
+lazy val nettyVersion = "4.2.18.Final"
+lazy val nettyTcnativeVersion = "2.0.84.Final"
+lazy val postgresqlVersion = "42.7.14"
+lazy val flywayVersion = "13.10.3"
+// Keep in step with the Caffeine version iceberg-core depends on (2.9.3 in Iceberg 1.11.0).
+lazy val caffeineVersion = "2.9.3"
+lazy val junitJupiterVersion = "5.13.4"
+// Declared in each test module: the jupiter-interface bridge pulls launcher 1.9, which must match.
+lazy val junitPlatformVersion = "1.13.4"
+lazy val testcontainersVersion = "1.21.4"
+val orgApacheHttpVersion = "4.5.14"
+
+// Latest patch on the Jackson line each Spark version ships, used to compile and test the
+// connector: Spark 4.0 ships 2.18 (4.0.0: 2.18.2), Spark 4.1 ships 2.20 (4.1.0: 2.20.0), and
+// Spark 4.2 ships 2.21 (4.2.0: 2.21.2). Clusters still run Spark's own jars.
+// jackson-core >= 2.18 is required by Spark 4.2's jackson-dataformat-yaml
+// (YAMLParser._updateToken).
+lazy val sparkJacksonVersion =
+  if (CrossSparkVersions.getSparkVersionSpec().isAtLeast(4, 2)) "2.21.7"
+  else if (CrossSparkVersions.getSparkVersionSpec().isAtLeast(4, 1)) "2.20.2"
+  else "2.18.11"
+// jackson-annotations is published as major.minor only from 2.20 onward (2.20, 2.21; for
+// example, 2.21.7 does not exist). 2.18.x still has patch releases, so Spark 4.0 matches
+// sparkJacksonVersion.
+lazy val sparkJacksonAnnotationsVersion =
+  if (CrossSparkVersions.getSparkVersionSpec().isAtLeast(4, 2)) "2.21"
+  else if (CrossSparkVersions.getSparkVersionSpec().isAtLeast(4, 1)) "2.20"
+  else "2.18.11"
+
+lazy val commonSettings = Seq(
+  organization := orgName,
+  // Compilation configs
+  initialize := {
+    // Assert that the JVM is at least Java 17
+    val _ = initialize.value  // ensure previous initializations are run
+    assert(
+      sys.props("java.specification.version").toDouble >= 17,
+      "Java 17 or above is required to run this project.")
+  },
+  Compile / compile / javacOptions ++= Seq(
+    "-Xlint:deprecation",
+    "-Xlint:unchecked",
+    "-g:source,lines,vars",
+  ),
+  Test / javaOptions ++= Seq (
+    "-ea",
+  ),
+  libraryDependencies ++= Seq(
+    "org.slf4j" % "slf4j-api" % "2.0.13",
+    "org.slf4j" % "slf4j-log4j12" % "2.0.13" % Test,
+  ),
+  excludeDependencies ++= Seq(
+    ExclusionRule("org.slf4j", "slf4j-reload4j")
+  ),
+  autoScalaLibrary := false,
+  crossPaths := false,  // No scala cross building
+  assembly / assemblyMergeStrategy := {
+    // Merged, not dropped: Flyway finds its database support through its ServiceLoader file.
+    case PathList("META-INF", "services", f) if f.startsWith("org.flywaydb") => MergeStrategy.filterDistinctLines
+    // Keep the Log4j provider registration that adds request_id to log lines.
+    case PathList("META-INF", "services", "org.apache.logging.log4j.core.util.ContextDataProvider") =>
+      MergeStrategy.concat
+    case PathList("META-INF", xs @ _*) => MergeStrategy.discard
+    case _ => MergeStrategy.first
+  },
+
+  // Test configs
+  Test / testOptions  := Seq(Tests.Argument(TestFrameworks.JUnit, "-a", "-v", "-q"), Tests.Filter(name => !(name startsWith s"$orgName.server.base"))),
+  Test / logLevel := util.Level.Info,
+  Test / publishArtifact := false,
+  fork := true,
+  outputStrategy := Some(StdoutOutput),
+
+  Compile / packageBin := {
+    val packageFile = (Compile / packageBin).value
+    generateClasspathFile(
+      targetDir = packageFile.getParentFile,
+      // Also include the jar being built (packageFile) in the classpath
+      // This is specifically required by the server project since the server and control models are provided dependencies
+      // The jar replaces the project's own class directory: with both, Flyway finds every
+      // migration step twice.
+      classpath = (Runtime / dependencyClasspath).value
+        .filterNot(_.data == (Compile / classDirectory).value) :+ Attributed.blank(packageFile)
+    )
+    packageFile
+  },
+
+  licenseConfigurations := Set("compile"),
+  licenseOverrides := {
+    case DepModuleInfo("io.unitycatalog", _, _) =>
+      LicenseInfo(LicenseCategory.Apache, "Apache 2.0", "http://www.apache.org/licenses")
+    case DepModuleInfo("org.hibernate.common", "hibernate-commons-annotations", _) =>
+      // Apache 2.0: https://mvnrepository.com/artifact/org.hibernate.common/hibernate-commons-annotations
+      LicenseInfo(LicenseCategory.Apache, "Apache 2.0", "http://www.apache.org/licenses")
+  },
+  licenseDepExclusions := {
+    // LGPL 2.1: https://www.gnu.org/licenses/old-licenses/lgpl-2.1.html
+    // https://en.wikipedia.org/wiki/GNU_Lesser_General_Public_License
+    // We can use and distribute the, but not modify the source code
+    case DepModuleInfo("org.hibernate.orm", _, _) => true
+    case DepModuleInfo("com.unboundid.scim2", _, _) => true
+    case DepModuleInfo("com.unboundid.product.scim2", _, _) => true
+    case DepModuleInfo("com.googlecode.aviator", _, _) => true
+    // Duo license:
+    //  - Eclipse Public License 2.0
+    //  - GNU General Public License, version 2 with the GNU Classpath Exception
+    // I think we're good with the classpath exception in there.
+    case DepModuleInfo("jakarta.transaction", "jakarta.transaction-api", _) => true
+    case DepModuleInfo("javax.annotation", "javax.annotation-api", _) => true
+  },
+  
+  assembly / test := {}
+) ++ TestParallelization.settings
+
+lazy val log4jProcessSettings = Seq(
+  libraryDependencies ++= Seq(
+    "org.apache.logging.log4j" % "log4j-core" % log4jVersion,
+    "org.apache.logging.log4j" % "log4j-slf4j2-impl" % log4jVersion,
+  )
+)
+
+// Configure resolvers
+resolvers ++= Seq(
+  "Maven Central" at "https://repo1.maven.org/maven2/",
+)
+
+// GJF 1.28.0: newest google-java-format that runs on the JDK 17 CI image without a
+// second JDK. Import sort/prune stay on (plugin defaults).
+ThisBuild / javafmtFormatterCompatibleJavaVersion := 17
+
+// enforce java code style
+def javafmtCheckSettings() = Seq(
+  (Compile / compile) := ((Compile / compile) dependsOn (Compile / javafmtAll)).value
+)
+
+lazy val controlApi = (project in file("target/control/java"))
+  .enablePlugins(OpenApiGeneratorPlugin)
+  .disablePlugins(JavaFormatterPlugin, CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-controlapi",
+    commonSettings,
+    skipReleaseSettings,
+    libraryDependencies ++= Seq(
+      "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
+      "org.apache.httpcomponents" % "httpclient" % orgApacheHttpVersion,
+      "org.apache.httpcomponents" % "httpmime" % orgApacheHttpVersion,
+    ),
+    (Compile / compile) := ((Compile / compile) dependsOn generate).value,
+
+    // OpenAPI generation specs
+    openApiInputSpec := (file(".") / "api" / "control.yaml").toString,
+    openApiGeneratorName := "java",
+    openApiOutputDir := (file("target") / "control" / "java").toString,
+    openApiApiPackage := s"$orgName.control.api",
+    openApiModelPackage := s"$orgName.control.model",
+    openApiAdditionalProperties := Map(
+      "library" -> "native",
+      "useJakartaEe" -> "true",
+      "hideGenerationTimestamp" -> "true",
+      "openApiNullable" -> "false"),
+    openApiGenerateApiTests := SettingDisabled,
+    openApiGenerateModelTests := SettingDisabled,
+    openApiGenerateApiDocumentation := SettingDisabled,
+    openApiGenerateModelDocumentation := SettingDisabled,
+    // Define the simple generate command to generate full client codes
+    generate := {
+      val _ = openApiGenerate.value
+
+      // Delete the generated build.sbt file so that it is not used for our sbt config
+      val buildSbtFile = file(openApiOutputDir.value) / "build.sbt"
+      if (buildSbtFile.exists()) {
+        buildSbtFile.delete()
+      }
+    }
+  )
+
+lazy val client = (project in file("clients/java"))
+  .settings(
+    name := s"$artifactNamePrefix-client",
+    commonSettings,
+    javaOnlyReleaseSettings,
+    Compile / compile / javacOptions ++= javacRelease11,
+    javaCheckstyleTestOnlySettings("dev/checkstyle-config.xml"),
+    // Include generated OpenAPI sources (from both all.yaml and delta.yaml, same output dir)
+    Compile / unmanagedSourceDirectories += (file(".") / "clients" / "java" / "target" / "src" / "main" / "java"),
+    libraryDependencies ++= Seq(
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
+      "org.openapitools" % "jackson-databind-nullable" % openApiToolsJacksonBindNullableVersion,
+      "com.google.code.findbugs" % "jsr305" % "3.0.2",
+      "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
+
+      // Test dependencies
+      "org.mockito" % "mockito-core" % "5.11.0" % Test,
+      "org.mockito" % "mockito-inline" % "5.2.0" % Test,
+      "org.mockito" % "mockito-junit-jupiter" % "5.12.0" % Test,
+      "org.junit.jupiter" % "junit-jupiter" % junitJupiterVersion % Test,
+      "org.junit.platform" % "junit-platform-launcher" % junitPlatformVersion % Test,
+      "net.aichler" % "jupiter-interface" % JupiterKeys.jupiterVersion.value % Test,
+      "org.assertj" % "assertj-core" % "3.26.3" % Test,
+    ),
+    (Compile / compile) := ((Compile / compile) dependsOn generate).value,
+    (Compile / doc) := ((Compile / doc) dependsOn generate).value,
+
+    // Add custom test sources and shared test resources from clients/java directory
+    Test / unmanagedSourceDirectories += (file(".") / "clients" / "java" / "src" / "test" / "java"),
+    Test / unmanagedResourceDirectories += (file(".") / "server" / "src" / "test" / "resources"),
+
+    // Generate from both all.yaml and delta.yaml into the same output directory
+    generate := {
+      val outputDir = (file(".") / "clients" / "java" / "target").toString
+      val commonProps = Map(
+        "library" -> "native",
+        "useJakartaEe" -> "true",
+        "hideGenerationTimestamp" -> "true",
+        "openApiNullable" -> "false",
+        "enumUnknownDefaultCase" -> "true",
+        "useOneOfDiscriminatorLookup" -> "true")
+      OpenApiHelper.generate(
+        outputDir = outputDir,
+        specs = Seq(
+          OpenApiSpec(
+            inputSpec = (file(".") / "api" / "all.yaml").toString,
+            invokerPackage = s"$orgName.client",
+            apiPackage = s"$orgName.client.api",
+            modelPackage = s"$orgName.client.model",
+            additionalProperties = commonProps
+          ),
+          OpenApiSpec(
+            inputSpec = (file(".") / "api" / "delta.yaml").toString,
+            invokerPackage = s"$orgName.client",
+            apiPackage = s"$orgName.client.delta.api",
+            modelPackage = s"$orgName.client.delta.model",
+            additionalProperties = commonProps
+          )
+        )
+      )
+      val buildSbtFile = file(outputDir) / "build.sbt"
+      if (buildSbtFile.exists()) buildSbtFile.delete()
+    },
+    // Add VersionInfo in the same way like in server
+    Compile / sourceGenerators += Def.task {
+      val file = (Compile / sourceManaged).value / "io" / "unitycatalog" / "client" / "VersionUtils.java"
+      IO.write(file,
+        s"""package io.unitycatalog.client;
+          |
+          |public class VersionUtils {
+          |  public static String VERSION = "${version.value}";
+          |}
+          |""".stripMargin)
+      Seq(file)
+    }
+  )
+
+lazy val prepareGeneration = taskKey[Unit]("Prepare the environment for OpenAPI code generation")
+
+lazy val pythonClient = (project in file("clients/python"))
+  .disablePlugins(CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-python-client",
+    commonSettings,
+    skipReleaseSettings,
+    Compile / compile := (Compile / compile).dependsOn(generate).value,
+
+    prepareGeneration := PythonClientPostBuild.prepareGeneration(
+      streams.value.log, baseDirectory.value,
+      (baseDirectory.value / "target").getAbsolutePath),
+
+    generate := Def.sequential(
+      prepareGeneration,
+      Def.task {
+        val outputDir = (baseDirectory.value / "target").getAbsolutePath
+        val commonProps = Map(
+          "packageVersion" -> s"${version.value.replace("-SNAPSHOT", ".dev0")}",
+          "library"        -> "asyncio"
+        )
+        OpenApiHelper.generate(
+          outputDir = outputDir,
+          generatorName = "python",
+          specs = Seq(
+            OpenApiSpec(
+              inputSpec = (baseDirectory.value.getParentFile.getParentFile / "api" / "all.yaml").getAbsolutePath,
+              packageName = s"$artifactNamePrefix.client",
+              additionalProperties = commonProps,
+              // Overrides python/asyncio/rest.mustache with the v7.11.0 version. See the header of
+              // build/templates/asyncio/rest.mustache for when to remove it.
+              templateDir = (baseDirectory.value / "build" / "templates").getAbsolutePath
+            ),
+            OpenApiSpec(
+              inputSpec = (baseDirectory.value.getParentFile.getParentFile / "api" / "delta.yaml").getAbsolutePath,
+              packageName = s"$artifactNamePrefix.delta",
+              additionalProperties = commonProps,
+              globalProperties = Map("apis" -> "", "models" -> "")
+            )
+          )
+        )
+      },
+      Def.task {
+        val log = streams.value.log
+        PythonClientPostBuild.processGeneratedFiles(
+          log,
+          (baseDirectory.value / "target").getAbsolutePath,
+          baseDirectory.value,
+        )
+        log.info("OpenAPI Python client generation completed.")
+      }
+    ).value
+  )
+
+lazy val apiDocs = (project in file("api"))
+  .disablePlugins(CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-docs",
+    skipReleaseSettings,
+    generate := {
+      OpenApiHelper.generate(
+        outputDir = (file("api")).toString,
+        generatorName = "markdown",
+        specs = Seq(
+          OpenApiSpec(
+            inputSpec = (file("api") / "all.yaml").toString
+          )
+        )
+      )
+      OpenApiHelper.generate(
+        outputDir = (file("api") / "delta-docs").toString,
+        generatorName = "markdown",
+        specs = Seq(
+          OpenApiSpec(
+            inputSpec = (file("api") / "delta.yaml").toString
+          )
+        )
+      )
+    }
+  )
+
+// Define the custom task key
+lazy val populateTestDB = taskKey[Unit]("Run PopulateTestDatabase main class from the test folder")
+
+lazy val server = (project in file("server"))
+  .dependsOn(client % "test->test")
+  // Server and control models are added as provided to avoid them being added as maven dependencies
+  // This is because the server and control models are included in the server jar
+  .dependsOn(serverModels % "provided", controlModels % "provided")
+  .dependsOn(controlApi % "test->compile")
+  .enablePlugins(CheckstylePlugin)
+  .settings (
+    name := s"$artifactNamePrefix-server",
+    mainClass := Some(orgName + ".server.UnityCatalogServer"),
+    commonSettings,
+    log4jProcessSettings,
+    javaOnlyReleaseSettings,
+    javafmtCheckSettings(),
+    javaCheckstyleSettings("dev/checkstyle-config.xml"),
+    Compile / compile / javacOptions ++= Seq(
+      "-processor",
+      "lombok.launch.AnnotationProcessorHider$AnnotationProcessor"
+    ) ++ javacRelease17,
+    libraryDependencies ++= Seq(
+      "com.linecorp.armeria" %  "armeria" % armeriaVersion,
+      "com.linecorp.armeria" % "armeria-prometheus1" % armeriaVersion,
+      "io.micrometer" % "micrometer-registry-prometheus" % micrometerVersion,
+      "org.apache.commons" % "commons-lang3" % "3.19.0",
+
+      // Netty dependencies. Armeria 1.33+ requires Netty 4.2; 4.2.x OpenSSL engine
+      // calls SSL.getGroupName, which exists only in tcnative 2.0.81+ (azure-core-http-netty
+      // otherwise wins with tcnative-classes 2.0.65 and Azure credential work hangs).
+      "io.netty" % "netty-all" % nettyVersion,
+      "io.netty" % "netty-tcnative-classes" % nettyTcnativeVersion,
+      "io.netty" % "netty-tcnative-boringssl-static" % nettyTcnativeVersion,
+      "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
+      // Jackson dependencies
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-yaml" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
+      // Delta Kernel validates set-columns schema evolution.
+      "io.delta" % "delta-kernel-api" % deltaVersion,
+
+      "com.google.code.findbugs" % "jsr305" % "3.0.2",
+      "com.github.ben-manes.caffeine" % "caffeine" % caffeineVersion,
+      "com.h2database" %  "h2" % "2.2.224",
+
+      "org.hibernate.orm" % "hibernate-core" % "6.5.0.Final",
+      "com.zaxxer" % "HikariCP" % "7.1.0",
+      "org.flywaydb" % "flyway-core" % flywayVersion,
+      "org.flywaydb" % "flyway-database-postgresql" % flywayVersion,
+      "org.flywaydb" % "flyway-mysql" % flywayVersion,
+
+      "jakarta.activation" % "jakarta.activation-api" % "2.1.3",
+      "net.bytebuddy" % "byte-buddy" % "1.14.15",
+      "org.projectlombok" % "lombok" % "1.18.32" % Provided,
+
+      // For ALDS access
+      "com.azure" % "azure-identity" % "1.18.6",
+      "com.azure" % "azure-storage-file-datalake" % "12.28.1",
+
+      // For GCS Access
+      "com.google.cloud" % "google-cloud-storage" % "2.73.0",
+      "com.google.auth" % "google-auth-library-oauth2-http" % "1.52.0",
+
+      //For s3 access
+      "com.amazonaws" % "aws-java-sdk-s3" % awsSdkV1Version,
+      "software.amazon.awssdk" % "sso" % awsSdkV2Version,
+      "software.amazon.awssdk" % "ssooidc" % awsSdkV2Version,
+
+      "org.apache.httpcomponents" % "httpcore" % "4.4.16",
+      "org.apache.httpcomponents" % "httpclient" % "4.5.14",
+
+      // Iceberg REST Catalog dependencies
+      "org.apache.iceberg" % "iceberg-core" % icebergVersion,
+      "org.apache.iceberg" % "iceberg-aws" % icebergVersion,
+      "org.apache.iceberg" % "iceberg-azure" % icebergVersion,
+      "org.apache.iceberg" % "iceberg-gcp" % icebergVersion,
+      "software.amazon.awssdk" % "s3" % awsSdkV2Version,
+      "software.amazon.awssdk" % "sts" % awsSdkV2Version,
+      // iceberg-aws transitively requires this dependency for table encryption support
+      "software.amazon.awssdk" % "kms" % awsSdkV2Version,
+      // Iceberg's S3FileIO loads the "apache" HTTP client by default, but AWS SDK v2 now pulls in
+      // apache5-client instead, so declare apache-client explicitly
+      "software.amazon.awssdk" % "apache-client" % awsSdkV2Version,
+
+      // Hadoop dependencies for ExternalLocationUtils
+      "org.apache.hadoop" % "hadoop-client-api" % hadoopVersion,
+
+      // Auth dependencies
+      "com.unboundid.product.scim2" % "scim2-sdk-common" % "3.2.0",
+      "org.casbin" % "jcasbin" % "1.99.0",
+      "org.casbin" % "jdbc-adapter" % "2.13.0"
+        exclude("com.microsoft.sqlserver", "mssql-jdbc")
+        exclude("com.oracle.database.jdbc", "ojdbc6"),
+      // Also a direct dependency so the published POM carries the Failsafe pin from
+      // dependencyOverrides below; see the TODO there.
+      "dev.failsafe" % "failsafe" % "3.2.3",
+      "org.postgresql" % "postgresql" % postgresqlVersion,
+      "org.springframework" % "spring-expression" % "6.2.19",
+      "com.auth0" % "java-jwt" % "4.6.1",
+      "com.auth0" % "jwks-rsa" % "0.24.1",
+
+      // Test dependencies
+      "org.junit.jupiter" % "junit-jupiter" % junitJupiterVersion % Test,
+      "org.junit.platform" % "junit-platform-launcher" % junitPlatformVersion % Test,
+      "org.mockito" % "mockito-core" % "5.11.0" % Test,
+      "org.mockito" % "mockito-inline" % "5.2.0" % Test,
+      "org.mockito" % "mockito-junit-jupiter" % "5.12.0" % Test,
+      "net.aichler" % "jupiter-interface" % JupiterKeys.jupiterVersion.value % Test,
+      "com.adobe.testing" % "s3mock-junit5" % "3.9.1" % Test
+        exclude("ch.qos.logback", "logback-classic")
+        exclude("org.apache.logging.log4j", "log4j-to-slf4j"),
+      "javax.xml.bind" % "jaxb-api" % "2.3.1" % Test,
+      // The upgrade tests run older releases, whose servers read Vert.x's version file at start.
+      "io.vertx" % "vertx-core" % "4.5.34" % Test,
+      // Reads the schema steps' SQL in MigrationStepRulesTest (Apache-2.0 or LGPL-2.1; tests only).
+      "com.github.jsqlparser" % "jsqlparser" % "5.4" % Test,
+
+      // Integration testing
+      "org.testcontainers" % "junit-jupiter" % testcontainersVersion % Test,
+
+      // CLI dependencies
+      "commons-cli" % "commons-cli" % "1.7.0"
+    ),
+    libraryDependencies ++= testDatabaseDependencies,
+    // Iceberg 1.11.0 brings its own Jackson version that conflicts with the project's pinned jackson version.
+    // Force AWS SDK v2 onto a single release as well (Iceberg and Hadoop otherwise mix 2.24 / 2.27).
+    dependencyOverrides ++= Seq(
+      // One PostgreSQL driver: jdbc-adapter brings 42.7.2. Keep in step with the direct dependency.
+      "org.postgresql" % "postgresql" % postgresqlVersion,
+      // jdbc-adapter 2.13.0 calls ExecutionContext.getLastFailure, which Failsafe 3.3.0 removed, so on
+      // the 3.3.2 that iceberg-aws brings a failed policy write throws NoSuchMethodError. iceberg-aws
+      // only uses Failsafe APIs that 3.2.3 has.
+      // TODO(https://github.com/apache/casbin-jcasbin-jdbc-adapter/pull/94): drop this pin once a
+      // jdbc-adapter release includes that change. The pin applies to this project only: serverShaded
+      // ships 3.2.3 because its assembly classpath is this project's, and any other module that depends
+      // on server resolves 3.3.2 unless it pins Failsafe too.
+      "dev.failsafe" % "failsafe" % "3.2.3",
+      "software.amazon.awssdk" % "sso" % awsSdkV2Version,
+      "software.amazon.awssdk" % "ssooidc" % awsSdkV2Version,
+      "software.amazon.awssdk" % "s3" % awsSdkV2Version,
+      "software.amazon.awssdk" % "sts" % awsSdkV2Version,
+      "software.amazon.awssdk" % "kms" % awsSdkV2Version,
+      "software.amazon.awssdk" % "auth" % awsSdkV2Version,
+      "io.netty" % "netty-all" % nettyVersion,
+      "io.netty" % "netty-tcnative-classes" % nettyTcnativeVersion,
+      "io.netty" % "netty-tcnative-boringssl-static" % nettyTcnativeVersion,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-core" % jacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-xml" % jacksonVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-yaml" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
+    ),
+
+    Compile / sourceGenerators += Def.task {
+      val file = (Compile / sourceManaged).value / "io" / "unitycatalog" / "server" / "utils" / "VersionUtils.java"
+      IO.write(file,
+        s"""package io.unitycatalog.server.utils;
+           |
+           |public class VersionUtils {
+           |  public static String VERSION = "${version.value}";
+           |}
+           |""".stripMargin)
+      Seq(file)
+    },
+    populateTestDB := {
+      val log = streams.value.log
+      (Test / runMain).toTask(s" io.unitycatalog.server.utils.PopulateTestDatabase").value
+    },
+    Test / javaOptions += s"-Duser.dir=${(ThisBuild / baseDirectory).value.getAbsolutePath}",
+    // Include server and control models in the bin package for server
+    // This will allow us to have a single maven artifact and not multiple (server, server models, control models)
+    Compile / packageBin / mappings ++= (Compile / packageBin / mappings).value ++
+      (serverModels / Compile / packageBin / mappings).value ++
+      (controlModels / Compile / packageBin / mappings).value
+  )
+
+lazy val serverModels = (project in file("server") / "target" / "models")
+  .disablePlugins(JavaFormatterPlugin, CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-servermodels",
+    commonSettings,
+    skipReleaseSettings,
+    (Compile / compile) := ((Compile / compile) dependsOn generate).value,
+    Compile / compile / javacOptions ++= javacRelease17,
+    libraryDependencies ++= Seq(
+      "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+    ),
+    // Generate model codes from both all.yaml and delta.yaml into the same output directory.
+    // Both use "resteasy" for minimal server-side models (no client SDK dependencies).
+    // Polymorphic types (TableUpdate, TableRequirement, DataType) use the
+    // discriminator + allOf pattern for proper Jackson deserialization.
+    generate := {
+      val outputDir = (file("server") / "target" / "models").toString
+      val commonProps = Map(
+        "library" -> "resteasy",
+        "useJakartaEe" -> "true",
+        "hideGenerationTimestamp" -> "true"
+      )
+      OpenApiHelper.generate(
+        outputDir = outputDir,
+        specs = Seq(
+          OpenApiSpec(
+            inputSpec = (file(".") / "api" / "all.yaml").toString,
+            modelPackage = s"$orgName.server.model",
+            additionalProperties = commonProps,
+            globalProperties = Map("models" -> "")
+          ),
+          OpenApiSpec(
+            inputSpec = (file(".") / "api" / "delta.yaml").toString,
+            modelPackage = s"$orgName.server.delta.model",
+            additionalProperties = commonProps,
+            globalProperties = Map("models" -> ""),
+          )
+        )
+      )
+    }
+  )
+
+lazy val controlModels = (project in file("server") / "target" / "controlmodels")
+  .enablePlugins(OpenApiGeneratorPlugin)
+  .disablePlugins(JavaFormatterPlugin, CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-controlmodels",
+    commonSettings,
+    skipReleaseSettings,
+    (Compile / compile) := ((Compile / compile) dependsOn generate).value,
+    Compile / compile / javacOptions ++= javacRelease17,
+    libraryDependencies ++= Seq(
+      "jakarta.annotation" % "jakarta.annotation-api" % "3.0.0" % Provided,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % jacksonVersion,
+    ),
+    // OpenAPI generation configs for generating model codes from the spec
+    openApiInputSpec := (file(".") / "api" / "control.yaml").toString,
+    openApiGeneratorName := "java",
+    openApiOutputDir := (file("server") / "target" / "controlmodels").toString,
+    openApiValidateSpec := SettingEnabled,
+    openApiGenerateMetadata := SettingDisabled,
+    openApiModelPackage := s"$orgName.control.model",
+    openApiAdditionalProperties := Map(
+      "library" -> "resteasy", // resteasy generates the most minimal models
+      "useJakartaEe" -> "true",
+      "hideGenerationTimestamp" -> "true"
+    ),
+    openApiGlobalProperties := Map("models" -> ""),
+    openApiGenerateApiTests := SettingDisabled,
+    openApiGenerateModelTests := SettingDisabled,
+    openApiGenerateApiDocumentation := SettingDisabled,
+    openApiGenerateModelDocumentation := SettingDisabled,
+    // Define the simple generate command to generate model codes
+    generate := {
+      val _ = openApiGenerate.value
+    }
+  )
+
+lazy val cli = (project in file("examples") / "cli")
+  .dependsOn(server % "test->test")
+  .dependsOn(serverModels)
+  .dependsOn(client % "compile->compile;test->test")
+  .dependsOn(controlApi % "compile->compile")
+  .enablePlugins(CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-cli",
+    mainClass := Some(orgName + ".cli.UnityCatalogCli"),
+    commonSettings,
+    log4jProcessSettings,
+    skipReleaseSettings,
+    javafmtCheckSettings(),
+    javaCheckstyleSettings("dev/checkstyle-config.xml"),
+    Compile / compile / javacOptions ++= javacRelease17,
+    libraryDependencies ++= Seq(
+      "commons-cli" % "commons-cli" % "1.7.0",
+      "org.json" % "json" % "20240303",
+      "com.fasterxml.jackson.core" % "jackson-databind" % jacksonVersion,
+      "com.fasterxml.jackson.datatype" % "jackson-datatype-jsr310" % jacksonVersion,
+      "org.openapitools" % "jackson-databind-nullable" % openApiToolsJacksonBindNullableVersion,
+      "org.yaml" % "snakeyaml" % "2.2",
+      "io.delta" % "delta-kernel-api" % deltaVersion,
+      "io.delta" % "delta-kernel-defaults" % deltaVersion,
+      "io.delta" % "delta-storage" % deltaVersion,
+      "io.delta" % "delta-kernel-unitycatalog" % deltaVersion,
+      "org.apache.hadoop" % "hadoop-client-api" % hadoopVersion,
+      "org.apache.hadoop" % "hadoop-client-runtime" % hadoopVersion,
+      "de.vandermeer" % "asciitable" % "0.3.2",
+      // for s3 access
+      "org.fusesource.jansi" % "jansi" % "2.4.1",
+      "com.amazonaws" % "aws-java-sdk-core" % awsSdkV1Version,
+      "org.apache.hadoop" % "hadoop-aws" % hadoopVersion,
+      "org.apache.hadoop" % "hadoop-azure" % hadoopVersion,
+      "com.google.guava" % "guava" % "31.0.1-jre",
+      // Test dependencies
+      "org.junit.jupiter" % "junit-jupiter" % junitJupiterVersion % Test,
+      "org.junit.platform" % "junit-platform-launcher" % junitPlatformVersion % Test,
+      "net.aichler" % "jupiter-interface" % JupiterKeys.jupiterVersion.value % Test,
+    ),
+    Test / javaOptions += s"-Duser.dir=${(ThisBuild / baseDirectory).value.getAbsolutePath}",
+  )
+
+// What the test-database harness needs to run on PostgreSQL: server, and spark and hadoop, which take
+// the harness from server-shaded.
+lazy val testDatabaseDependencies = Seq(
+  "org.testcontainers" % "testcontainers" % testcontainersVersion % Test,
+  "org.testcontainers" % "postgresql" % testcontainersVersion % Test,
+  "org.postgresql" % "postgresql" % postgresqlVersion % Test,
+  "org.testcontainers" % "mysql" % testcontainersVersion % Test,
+  "com.mysql" % "mysql-connector-j" % "8.4.0" % Test,
+)
+
+/*
+  * This project is a combination of the server and client projects, shaded into a single JAR.
+  * It also includes the test classes from the server project.
+  * It is used for the Spark connector project(the client is required as a compile dependency,
+  * and the server(with tests) is required as a test dependency)
+  * This was necessary because Spark 3.5 has a dependency on Jackson 2.15, which conflicts with the Jackson 2.17
+ */
+lazy val serverShaded = (project in file("server-shaded"))
+  .dependsOn(server % "compile->compile, test->compile")
+  .settings(
+    name := s"$artifactNamePrefix-server-shaded",
+    commonSettings,
+    skipReleaseSettings,
+    Compile / packageBin := assembly.value,
+    assembly / mainClass := Some("io.unitycatalog.server.UnityCatalogServer"),
+    assembly / logLevel := Level.Warn,
+    assembly / test := {},
+    assembly / assemblyShadeRules := Seq(
+      ShadeRule.rename("com.fasterxml.**" -> "shaded.@0").inAll,
+      ShadeRule.rename("org.antlr.**" -> "shaded.@0").inAll,
+      ShadeRule.rename("io.netty.**" -> "shaded.@0").inAll,
+      // Relocate the bundled Kernel and RoaringBitmap so they cannot clash with the copies that
+      // Spark and Delta put on the connector test classpaths.
+      ShadeRule.rename("io.delta.kernel.**" -> "shaded.@0").inAll,
+      ShadeRule.rename("org.roaringbitmap.**" -> "shaded.@0").inAll,
+    ),
+    assemblyPackageScala / assembleArtifact := false,
+    assembly / fullClasspath := {
+      val compileClasspath = (server / Compile / fullClasspath).value
+      val testClasses = (server / Test / products).value
+      compileClasspath ++ testClasses.map(Attributed.blank)
+    }
+  )
+
+lazy val spark = (project in file("connectors/spark"))
+  .dependsOn(client, hadoop)
+  .enablePlugins(CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-spark",
+    // Append Spark major.minor suffix to the artifact name so each Spark version
+    // publishes under a distinct coordinate (e.g. unitycatalog-spark_4.1_2.13).
+    Keys.moduleName := CrossSparkVersions.sparkVersionedModuleName(name.value),
+    CrossSparkVersions.sparkDependentSettings,
+    scalaVersion := scala213,
+    crossScalaVersions := Seq(scala213),
+    commonSettings,
+    scalaReleaseSettings,
+    javaOptions ++= Seq(
+      "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED",
+      "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED",
+    ),
+    // Arrow-backed vectorized reads need java.nio opened for off-heap memory access.
+    Test / javaOptions += "--add-opens=java.base/java.nio=ALL-UNNAMED",
+    // Test-only Spark/Delta settings.
+    Test / javaOptions ++= Seq(
+      // No web UI, which would bind a port for every Spark session.
+      "-Dspark.ui.enabled=false",
+      // No progress bars in the test output.
+      "-Dspark.ui.showConsoleProgress=false",
+      // Delta rebuilds table snapshots with 50 partitions by default, sized for real tables; for
+      // tiny test tables that overhead dominates the Delta read/write suites.
+      "-Dspark.databricks.delta.snapshotPartitions=2",
+    ),
+    javafmtCheckSettings(),
+    javaCheckstyleSettings("dev/checkstyle-config.xml"),
+    Compile / compile / javacOptions ++= javacRelease11,
+    Test / compile / javacOptions := {
+      // lombok is only a dependency of test. So its path needs to be added explicitly.
+      val lombokPath = (Test / dependencyClasspath).value
+        .files
+        .filter(_.getName.contains("lombok"))
+        .mkString(File.pathSeparator)
+      // Spark 4.2+ connector tests reference Java records (e.g. Dependency.table); require --release 17.
+      val testRelease =
+        if (CrossSparkVersions.getSparkVersionSpec().isAtLeast(4, 2)) {
+          javacRelease17
+        } else {
+          javacRelease11
+        }
+      testRelease ++ Seq(
+        "-processor",
+        "lombok.launch.AnnotationProcessorHider$AnnotationProcessor",
+        "-processorpath",
+        lombokPath
+      )
+    },
+    libraryDependencies ++= Seq(
+      "org.apache.spark" %% "spark-sql" % sparkVersion % Provided,
+      "com.fasterxml.jackson.core" % "jackson-databind" % sparkJacksonVersion,
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % sparkJacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % sparkJacksonAnnotationsVersion,
+      "com.fasterxml.jackson.core" % "jackson-core" % sparkJacksonVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-xml" % sparkJacksonVersion,
+      "org.antlr" % "antlr4-runtime" % "4.13.1",
+      "org.antlr" % "antlr4" % "4.13.1",
+      "com.google.cloud.bigdataoss" % "util-hadoop" % "3.0.2" % Provided,
+      "org.apache.hadoop" % "hadoop-azure" % hadoopVersion % Provided,
+      "software.amazon.awssdk" % "auth" % awsSdkV2Version % Provided,
+    ),
+    libraryDependencies ++= Seq(
+      // Test dependencies
+      "org.junit.jupiter" % "junit-jupiter" % junitJupiterVersion % Test,
+      "org.junit.platform" % "junit-platform-launcher" % junitPlatformVersion % Test,
+      "org.assertj" % "assertj-core" % "3.26.3" % Test,
+      "org.mockito" % "mockito-core" % "5.11.0" % Test,
+      "org.mockito" % "mockito-inline" % "5.2.0" % Test,
+      "org.mockito" % "mockito-junit-jupiter" % "5.12.0" % Test,
+      "net.aichler" % "jupiter-interface" % JupiterKeys.jupiterVersion.value % Test,
+      "org.apache.hadoop" % "hadoop-client-runtime" % hadoopVersion,
+      "org.apache.hadoop" % "hadoop-aws" % hadoopVersion % Test,
+      "org.projectlombok" % "lombok" % "1.18.32" % Test,
+      "com.google.cloud.bigdataoss" % "gcs-connector" % "3.0.2" % Test classifier "shaded",
+    ) ++ CrossSparkVersions.deltaSparkTestDeps(deltaVersion)
+      ++ CrossSparkVersions.icebergSparkTestDeps(icebergVersion),
+    dependencyOverrides ++= Seq(
+      "com.fasterxml.jackson.core" % "jackson-databind" % sparkJacksonVersion,
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % sparkJacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % sparkJacksonAnnotationsVersion,
+      "com.fasterxml.jackson.core" % "jackson-core" % sparkJacksonVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-xml" % sparkJacksonVersion,
+      "org.antlr" % "antlr4-runtime" % "4.13.1",
+      "org.antlr" % "antlr4" % "4.13.1",
+    ),
+    Test / unmanagedJars += (serverShaded / assembly).value,
+    libraryDependencies ++= testDatabaseDependencies,
+    // netty-codec-native-quic uses ${packaging.type} in its POM which Ivy (used by sbt-license-report) cannot resolve.
+    // Exclude it so Ivy never attempts to fetch it; Coursier (used for normal builds) handles it fine.
+    excludeDependencies += ExclusionRule("io.netty", "netty-codec-native-quic"),
+    licenseDepExclusions := {
+      case DepModuleInfo("org.hibernate.orm", _, _) => true
+      case DepModuleInfo("jakarta.annotation", "jakarta.annotation-api", _) => true
+      case DepModuleInfo("jakarta.servlet", "jakarta.servlet-api", _) => true
+      case DepModuleInfo("jakarta.transaction", "jakarta.transaction-api", _) => true
+      case DepModuleInfo("jakarta.ws.rs", "jakarta.ws.rs-api", _) => true
+      case DepModuleInfo("javax.activation", "activation", _) => true
+      case DepModuleInfo("javax.servlet", "javax.servlet-api", _) => true
+      case DepModuleInfo("org.glassfish.hk2", "hk2-api", _) => true
+      case DepModuleInfo("org.glassfish.hk2", "hk2-locator", _) => true
+      case DepModuleInfo("org.glassfish.hk2", "hk2-utils", _) => true
+      case DepModuleInfo("org.glassfish.hk2", "osgi-resource-locator", _) => true
+      case DepModuleInfo("org.glassfish.hk2.external", "aopalliance-repackaged", _) => true
+      case DepModuleInfo("ch.qos.logback", "logback-classic", _) => true
+      case DepModuleInfo("ch.qos.logback", "logback-core", _) => true
+      case DepModuleInfo("org.apache.xbean", "xbean-asm9-shaded", _) => true
+      case DepModuleInfo("oro", "oro", _) => true
+      case DepModuleInfo("org.glassfish", "javax.json", _) => true
+      case DepModuleInfo("org.glassfish.hk2.external", "jakarta.inject", _) => true
+      case DepModuleInfo("org.antlr", "ST4", _) => true
+    }
+  )
+
+lazy val hadoop = (project in file("connectors/hadoop"))
+  .dependsOn(client)
+  .enablePlugins(CheckstylePlugin)
+  .settings(
+    name := s"$artifactNamePrefix-hadoop",
+    commonSettings,
+    javaOnlyReleaseSettings,
+    javafmtCheckSettings(),
+    javaCheckstyleSettings("dev/checkstyle-config.xml"),
+    Compile / compile / javacOptions ++= javacRelease11,
+    libraryDependencies ++= Seq(
+      "org.apache.hadoop" % "hadoop-client-api" % hadoopVersion % Provided,
+      "com.google.cloud.bigdataoss" % "util-hadoop" % "3.0.2" % Provided,
+      "org.apache.hadoop" % "hadoop-azure" % hadoopVersion % Provided,
+      "software.amazon.awssdk" % "auth" % awsSdkV2Version % Provided,
+    ),
+    libraryDependencies ++= Seq(
+      // Test dependencies
+      "org.junit.jupiter" % "junit-jupiter" % junitJupiterVersion % Test,
+      "org.junit.platform" % "junit-platform-launcher" % junitPlatformVersion % Test,
+      "org.assertj" % "assertj-core" % "3.26.3" % Test,
+      "org.mockito" % "mockito-core" % "5.11.0" % Test,
+      "org.mockito" % "mockito-inline" % "5.2.0" % Test,
+      "org.mockito" % "mockito-junit-jupiter" % "5.12.0" % Test,
+      "net.aichler" % "jupiter-interface" % JupiterKeys.jupiterVersion.value % Test,
+      "org.apache.hadoop" % "hadoop-client-runtime" % hadoopVersion % Test,
+      "org.apache.hadoop" % "hadoop-aws" % hadoopVersion % Test,
+      "com.google.cloud.bigdataoss" % "gcs-connector" % "3.0.2" % Test classifier "shaded",
+    ),
+    Test / unmanagedJars += (serverShaded / assembly).value,
+    libraryDependencies ++= testDatabaseDependencies,
+  )
+
+lazy val integrationTests = (project in file("integration-tests"))
+  .enablePlugins(CheckstylePlugin)
+  .dependsOn(spark)
+  .settings(
+    name := s"$artifactNamePrefix-integration-tests",
+    commonSettings,
+    scalaVersion := scala213,
+    javaOptions ++= Seq(
+      "--add-exports=java.base/sun.nio.ch=ALL-UNNAMED",
+    ),
+    javafmtCheckSettings(),
+    javaCheckstyleSettings("dev/checkstyle-config.xml"),
+    skipReleaseSettings,
+    libraryDependencies ++= Seq(
+      "org.junit.jupiter" % "junit-jupiter" % junitJupiterVersion % Test,
+      "org.junit.platform" % "junit-platform-launcher" % junitPlatformVersion % Test,
+      "net.aichler" % "jupiter-interface" % JupiterKeys.jupiterVersion.value % Test,
+      "org.assertj" % "assertj-core" % "3.26.3" % Test,
+      "org.projectlombok" % "lombok" % "1.18.32" % Provided,
+      "org.apache.spark" %% "spark-sql" % sparkVersion % Test,
+      "org.apache.hadoop" % "hadoop-aws" % hadoopVersion % Test,
+      "org.apache.hadoop" % "hadoop-azure" % hadoopVersion % Test,
+      "com.google.cloud.bigdataoss" % "gcs-connector" % "3.0.2" % Test classifier "shaded",
+    ) ++ CrossSparkVersions.deltaSparkTestDeps(deltaVersion),
+    dependencyOverrides ++= Seq(
+      "com.fasterxml.jackson.core" % "jackson-databind" % sparkJacksonVersion,
+      "com.fasterxml.jackson.module" %% "jackson-module-scala" % sparkJacksonVersion,
+      "com.fasterxml.jackson.core" % "jackson-annotations" % sparkJacksonAnnotationsVersion,
+      "com.fasterxml.jackson.core" % "jackson-core" % sparkJacksonVersion,
+      "com.fasterxml.jackson.dataformat" % "jackson-dataformat-xml" % sparkJacksonVersion,
+      "org.antlr" % "antlr4-runtime" % "4.13.1",
+      "org.antlr" % "antlr4" % "4.13.1",
+      "org.apache.hadoop" % "hadoop-client-api" % hadoopVersion,
+    ),
+    Test / javaOptions += s"-Duser.dir=${((ThisBuild / baseDirectory).value / "integration-tests").getAbsolutePath}",
+  )
+
+lazy val root = (project in file("."))
+  .aggregate(serverModels, client, pythonClient, server, cli, spark, hadoop, controlApi, controlModels, apiDocs)
+  .settings(
+    name := s"$artifactNamePrefix",
+    createTarballSettings(),
+    commonSettings,
+    rootReleaseSettings,
+    // dev/run-tests.py keeps its log and suite durations here, also across a `clean` in the run.
+    cleanKeepFiles ++= Seq(target.value / "test-logs", target.value / "test-durations.csv"),
+  )
+
+TestParallelization.globalSettings
+
+def generateClasspathFile(targetDir: File, classpath: Classpath): Unit = {
+  // Generate a classpath file with the entire runtime class path.
+  // This is used by the launcher scripts for launching CLI directly with JAR instead of SBT.
+  val classpathFile = targetDir / "classpath"
+  Files.write(classpathFile.toPath, classpath.files.mkString(File.pathSeparator).getBytes)
+  println(s"Generated classpath file '$classpathFile'")
+}
+
+val generate = taskKey[Unit]("generate code from APIs")
+
+// Runs every project's tests on one test database. One alias per SupportedDatabase constant except
+// H2 (the default).
+def testOnDatabase(database: String): String =
+  s"""; set every Test / envVars := Map("UC_TEST_DATABASE" -> "$database") ; test"""
+addCommandAlias("testPostgres18", testOnDatabase("POSTGRES_18"))
+addCommandAlias("testMySQL8", testOnDatabase("MYSQL_8"))
+
+// Rewrites the schema effect files (server/src/main/resources/schema-effects) from the steps, on
+// every database. PostgreSQL and MySQL need Docker.
+addCommandAlias(
+  "updateSchemaDumps",
+  Seq("H2", "POSTGRES_18", "MYSQL_8").map { database =>
+    s"""; set every Test / envVars := Map("UC_TEST_DATABASE" -> "$database", "UC_TEST_MIGRATION_CHECKS" -> "true", "UC_UPDATE_SCHEMA_EFFECTS" -> "true")""" +
+      " ; server/testOnly io.unitycatalog.server.migrate.MigrationStepRulesTest"
+  }.mkString)

@@ -1,0 +1,749 @@
+package io.unitycatalog.server.utils;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import io.unitycatalog.server.exception.BaseException;
+import io.unitycatalog.server.model.TableType;
+import io.unitycatalog.server.service.credential.aws.S3StorageConfig;
+import io.unitycatalog.server.utils.ServerProperties.Property;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.CopyOnWriteArrayList;
+import org.apache.logging.log4j.Level;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LogEvent;
+import org.apache.logging.log4j.core.Logger;
+import org.apache.logging.log4j.core.appender.AbstractAppender;
+import org.apache.logging.log4j.core.config.Configurator;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+public class ServerPropertiesTest {
+
+  @Test
+  public void testOpaAuthorizationProperties() {
+    ServerProperties properties = new ServerProperties();
+    assertThat(properties.isOpaAuthorizationEnabled()).isFalse();
+    assertThat(properties.getOpaResponseTimeout()).isEqualTo(Duration.ofSeconds(5));
+    testValidProperty(Property.AUTHORIZATION_PROVIDER, "casbin");
+    testInvalidProperty(Property.AUTHORIZATION_PROVIDER, "other", "server.authorization.provider");
+    testValidProperty(Property.OPA_RESPONSE_TIMEOUT, "PT0.001S");
+    for (String timeout : List.of("PT0S", "PT-1S", "PT0.0001S", "bad")) {
+      testInvalidProperty(
+          Property.OPA_RESPONSE_TIMEOUT, timeout, "server.authorization.opa.response-timeout");
+    }
+
+    for (String url :
+        List.of(
+            "http://localhost:8181/v1/data/uc/authz",
+            "https://opa.example.com/v1/data/uc/authz",
+            "http://opa_server:8181/v1/data/uc/authz",
+            "http://[::1]:8181/v1/data/uc/authz")) {
+      testValidProperty(Property.OPA_DECISION_URL, url);
+    }
+    for (String url :
+        List.of(
+            "not a URL",
+            "http://opa_server:bad/policy",
+            "file:///policy",
+            "ftp://localhost/policy",
+            "http:/policy",
+            "http://user:pass@localhost:8181/policy",
+            "http://localhost:8181/policy#fragment",
+            "http://localhost:0/policy",
+            "http://localhost:65536/policy",
+            "http://user:pass@opa_server:8181/policy",
+            "http://opa_server:8181/policy#fragment",
+            "http://opa_server:0/policy",
+            "http://opa_server:65536/policy",
+            "http://opa_server:-1/policy",
+            "http://-opa_server:8181/policy",
+            "http://:8181/policy")) {
+      testInvalidProperty(Property.OPA_DECISION_URL, url, "must be an absolute HTTP or HTTPS URL");
+    }
+
+    assertThatThrownBy(
+            () ->
+                properties.set(
+                    Property.OPA_DECISION_URL, "http://user:secret@localhost:bad/policy"))
+        .isInstanceOf(BaseException.class)
+        .hasMessage(
+            "server.authorization.opa.decision-url must be an absolute HTTP or HTTPS URL"
+                + " without credentials or a fragment")
+        .hasNoCause();
+  }
+
+  @Test
+  public void testOpaAuthorizationConfiguration() {
+    Properties props = new Properties();
+    props.setProperty(Property.AUTHORIZATION_PROVIDER.getKey(), "OPA");
+    props.setProperty(Property.OPA_DECISION_URL.getKey(), "http://localhost:8181/v1/data/uc/authz");
+    assertThatThrownBy(() -> new ServerProperties(props))
+        .isInstanceOf(BaseException.class)
+        .hasMessage(
+            "server.authorization=enable is required when server.authorization.provider=opa");
+
+    props.setProperty(Property.AUTHORIZATION_ENABLED.getKey(), "enable");
+    ServerProperties properties = new ServerProperties(props);
+    assertThat(properties.isOpaAuthorizationEnabled()).isTrue();
+    assertThat(properties.getOpaDecisionUrl()).isEqualTo("http://localhost:8181/v1/data/uc/authz");
+
+    props.remove(Property.OPA_DECISION_URL.getKey());
+    assertThatThrownBy(() -> new ServerProperties(props))
+        .isInstanceOf(BaseException.class)
+        .hasMessageContaining("server.authorization.opa.decision-url is required");
+  }
+
+  private void testValidProperty(Property property, String value) {
+    Properties props = new Properties();
+    props.setProperty(property.getKey(), value);
+    ServerProperties serverProperties1 = new ServerProperties(props);
+    assertThat(serverProperties1.get(property)).isEqualTo(value);
+
+    ServerProperties serverProperties2 = new ServerProperties();
+    serverProperties2.set(property, value);
+    assertThat(serverProperties2.get(property)).isEqualTo(value);
+  }
+
+  private void testInvalidProperty(Property property, String value, String... exceptionMessages) {
+    Properties props = new Properties();
+    props.setProperty(property.getKey(), value);
+    var assertion1 =
+        assertThatThrownBy(() -> new ServerProperties(props)).isInstanceOf(BaseException.class);
+    for (String exceptionMessage : exceptionMessages) {
+      assertion1.hasMessageContaining(exceptionMessage);
+    }
+
+    ServerProperties serverProperties2 = new ServerProperties();
+    var assertion2 =
+        assertThatThrownBy(() -> serverProperties2.set(property, value))
+            .isInstanceOf(BaseException.class);
+    for (String exceptionMessage : exceptionMessages) {
+      assertion2.hasMessageContaining(exceptionMessage);
+    }
+  }
+
+  @Test
+  public void testStoragePathValidator() {
+    // Valid paths - local absolute and relative
+    testValidProperty(Property.MODEL_STORAGE_ROOT, "/tmp/my-storage_123");
+    testValidProperty(Property.MODEL_STORAGE_ROOT, "/tmp/storage/");
+    testValidProperty(Property.MODEL_STORAGE_ROOT, "relative/path/to/storage");
+    testValidProperty(Property.TABLE_STORAGE_ROOT, "./relative/path");
+
+    // Valid paths - file URIs
+    testValidProperty(Property.MODEL_STORAGE_ROOT, "file:///tmp/my-storage");
+    testValidProperty(Property.TABLE_STORAGE_ROOT, "file://tmp/my-storage");
+    testValidProperty(Property.TABLE_STORAGE_ROOT, "file:/tmp/my-storage");
+
+    // Valid paths - cloud storage (S3, ABFS, GCS)
+    testValidProperty(Property.MODEL_STORAGE_ROOT, "s3://my-bucket/my-prefix");
+    testValidProperty(Property.TABLE_STORAGE_ROOT, "s3://my-bucket/prefix/");
+    testValidProperty(
+        Property.MODEL_STORAGE_ROOT, "abfs://my-container@my-storage.dfs.core.windows.net/my-path");
+    testValidProperty(Property.TABLE_STORAGE_ROOT, "gs://my-bucket/my-path");
+
+    // Invalid - unsupported URI schemes
+    testInvalidProperty(
+        Property.MODEL_STORAGE_ROOT,
+        "ftp://example.com/path",
+        "Invalid storage path",
+        "storage-root.models",
+        "Unsupported URI scheme: ftp");
+    testInvalidProperty(
+        Property.TABLE_STORAGE_ROOT,
+        "http://example.com/path",
+        "Invalid storage path",
+        "storage-root.tables",
+        "Unsupported URI scheme: http");
+    testInvalidProperty(
+        Property.MODEL_STORAGE_ROOT,
+        "https://example.com/path",
+        "Invalid storage path",
+        "storage-root.models",
+        "Unsupported URI scheme: https");
+
+    // Invalid - malformed URIs
+    testInvalidProperty(
+        Property.MODEL_STORAGE_ROOT,
+        "s3://bucket with spaces/path",
+        "Invalid storage path",
+        "storage-root.models");
+    testInvalidProperty(
+        Property.MODEL_STORAGE_ROOT,
+        "C:\\Users\\test\\storage",
+        "Invalid storage path",
+        "storage-root.models");
+  }
+
+  @Test
+  public void testBooleanValidator() {
+    // Valid values
+    testValidProperty(Property.MANAGED_TABLE_ENABLED, "true");
+    testValidProperty(Property.MANAGED_TABLE_ENABLED, "false");
+    testValidProperty(Property.MANAGED_TABLE_ENABLED, "TRUE");
+    testValidProperty(Property.ICEBERG_TABLE_ENABLED, "true");
+    testValidProperty(Property.ICEBERG_TABLE_ENABLED, "false");
+    testValidProperty(Property.ICEBERG_TABLE_ENABLED, "TRUE");
+
+    // Invalid values
+    testInvalidProperty(
+        Property.MANAGED_TABLE_ENABLED,
+        "yes",
+        "Invalid value 'yes'",
+        "server.managed-table.enabled",
+        "Allowed values: [true, false]");
+    testInvalidProperty(
+        Property.ICEBERG_TABLE_ENABLED,
+        "yes",
+        "Invalid value 'yes'",
+        "server.iceberg-table.enabled",
+        "Allowed values: [true, false]");
+  }
+
+  @Test
+  public void testStrictPrivilegeChecksSetting() {
+    ServerProperties properties = new ServerProperties();
+    assertThat(properties.isStrictPrivilegeChecksEnabled()).isTrue();
+    properties.set(Property.STRICT_PRIVILEGE_CHECKS_ENABLED, "false");
+    assertThat(properties.isStrictPrivilegeChecksEnabled()).isFalse();
+    properties.set(Property.STRICT_PRIVILEGE_CHECKS_ENABLED, "true");
+    assertThat(properties.isStrictPrivilegeChecksEnabled()).isTrue();
+    testInvalidProperty(
+        Property.STRICT_PRIVILEGE_CHECKS_ENABLED,
+        "yes",
+        "Invalid value 'yes'",
+        "server.authorization.strict-privilege-checks");
+  }
+
+  @Test
+  public void testIcebergTableEnabledCheck() {
+    ServerProperties serverProperties = new ServerProperties();
+    // Iceberg tables are enabled by default, so the check passes without extra configuration.
+    assertThat(serverProperties.isIcebergTableEnabled()).isTrue();
+    serverProperties.checkIcebergTableEnabled();
+
+    serverProperties.set(Property.ICEBERG_TABLE_ENABLED, "false");
+    assertThat(serverProperties.isIcebergTableEnabled()).isFalse();
+    assertThatThrownBy(serverProperties::checkIcebergTableEnabled)
+        .isInstanceOf(BaseException.class)
+        .hasMessageContaining("server.iceberg-table.enabled=true");
+  }
+
+  @Test
+  public void testExternalLocalRootsValidator() {
+    testValidProperty(Property.EXTERNAL_LOCAL_ROOTS, "/data/uc-external");
+    testValidProperty(Property.EXTERNAL_LOCAL_ROOTS, "file:///data/uc-external/");
+    testValidProperty(Property.EXTERNAL_LOCAL_ROOTS, "/data/a, file:///data/b");
+
+    // Only local paths.
+    testInvalidProperty(
+        Property.EXTERNAL_LOCAL_ROOTS,
+        "/data/ok,s3://bucket/b",
+        "Invalid local path 's3://bucket/b'",
+        "server.external-local-roots");
+    // A local path NormalizedURL rejects (see NormalizedURLTest for the cases).
+    testInvalidProperty(
+        Property.EXTERNAL_LOCAL_ROOTS,
+        "/data/ok,file:///data/a%2Fb",
+        "Invalid local path 'file:///data/a%2Fb'",
+        "server.external-local-roots");
+  }
+
+  @Test
+  public void testExternalLocalRoots() {
+    // Fails closed: no local roots unless configured.
+    assertThat(new ServerProperties().getExternalLocalRoots()).isEmpty();
+
+    Properties props = new Properties();
+    props.setProperty(
+        Property.EXTERNAL_LOCAL_ROOTS.getKey(), " /data/uc-external/ , file:///mnt/shared,");
+    assertThat(new ServerProperties(props).getExternalLocalRoots())
+        .containsExactly(Paths.get("/data/uc-external"), Paths.get("/mnt/shared"));
+
+    // A root is the path the server opens: %2D is "-".
+    props.setProperty(Property.EXTERNAL_LOCAL_ROOTS.getKey(), "file:///data/uc%2Dext");
+    assertThat(new ServerProperties(props).getExternalLocalRoots())
+        .containsExactly(Paths.get("/data/uc-ext"));
+  }
+
+  @Test
+  public void testEnumValidator() {
+    // Valid values - SERVER_ENV
+    testValidProperty(Property.SERVER_ENV, "dev");
+    testValidProperty(Property.SERVER_ENV, "prod");
+    testValidProperty(Property.SERVER_ENV, "test");
+    testValidProperty(Property.SERVER_ENV, "PROD");
+
+    // Valid values - AUTHORIZATION_ENABLED
+    testValidProperty(Property.AUTHORIZATION_ENABLED, "enable");
+    testValidProperty(Property.AUTHORIZATION_ENABLED, "disable");
+
+    // Invalid values
+    testInvalidProperty(Property.SERVER_ENV, "staging", "Invalid value 'staging'", "server.env");
+    testInvalidProperty(
+        Property.AUTHORIZATION_ENABLED, "yes", "Invalid value 'yes'", "server.authorization");
+  }
+
+  @Test
+  public void testUrlValidator() {
+    // Valid URLs
+    testValidProperty(Property.AUTHORIZATION_URL, "https://auth.example.com/authorize");
+    testValidProperty(Property.TOKEN_URL, "http://localhost:8080/token");
+
+    // Invalid URLs
+    testInvalidProperty(
+        Property.AUTHORIZATION_URL,
+        "not a valid url",
+        "Invalid URL 'not a valid url'",
+        "server.authorization-url");
+    testInvalidProperty(
+        Property.TOKEN_URL,
+        "example.com/path",
+        "Invalid URL 'example.com/path'",
+        "server.token-url");
+    testInvalidProperty(
+        Property.TOKEN_URL,
+        "s3://example.com/path",
+        "Invalid URL 's3://example.com/path'",
+        "server.token-url");
+  }
+
+  @Test
+  public void testPositiveIntegerValidator() {
+    // Valid values
+    testValidProperty(Property.REDIRECT_PORT, "8080");
+    testValidProperty(Property.REDIRECT_PORT, "65535");
+
+    // Invalid values
+    testInvalidProperty(
+        Property.REDIRECT_PORT,
+        "0",
+        "Invalid value '0'",
+        "server.redirect-port",
+        "Expected a positive integer (> 0)");
+    testInvalidProperty(
+        Property.REDIRECT_PORT,
+        "-1",
+        "Invalid value '-1'",
+        "server.redirect-port",
+        "Expected a positive integer (> 0)");
+    testInvalidProperty(
+        Property.REDIRECT_PORT,
+        "abc",
+        "Invalid value 'abc'",
+        "server.redirect-port",
+        "Expected an integer");
+    testInvalidProperty(
+        Property.REDIRECT_PORT,
+        "8080.5",
+        "Invalid value '8080.5'",
+        "server.redirect-port",
+        "Expected an integer");
+  }
+
+  @Test
+  public void testDurationValidator() {
+    // Valid values
+    testValidProperty(Property.COOKIE_TIMEOUT, "P5D");
+    testValidProperty(Property.COOKIE_TIMEOUT, "PT2H");
+    testValidProperty(Property.COOKIE_TIMEOUT, "P1DT12H30M");
+    testValidProperty(Property.ACCESS_TOKEN_TIMEOUT, "PT24H");
+    testValidProperty(Property.ACCESS_TOKEN_TIMEOUT, "PT1H");
+    testValidProperty(Property.POLICY_REFRESH_MIN_PROBE_INTERVAL, "PT0S");
+    testValidProperty(Property.POLICY_REFRESH_MIN_PROBE_INTERVAL, "PT0.1S");
+    testValidProperty(Property.POLICY_REFRESH_MIN_PROBE_INTERVAL, "PT1S");
+
+    // Invalid values
+    testInvalidProperty(
+        Property.COOKIE_TIMEOUT, "5 days", "Invalid value '5 days'", "server.cookie-timeout");
+    testInvalidProperty(
+        Property.COOKIE_TIMEOUT, "P5X", "Invalid value 'P5X'", "server.cookie-timeout");
+    testInvalidProperty(
+        Property.ACCESS_TOKEN_TIMEOUT,
+        "24 hours",
+        "Invalid value '24 hours'",
+        "server.access-token-timeout");
+    testInvalidProperty(
+        Property.COOKIE_TIMEOUT, "PT-1S", "must be zero or positive", "server.cookie-timeout");
+    testInvalidProperty(
+        Property.ACCESS_TOKEN_TIMEOUT,
+        "PT-1S",
+        "must be zero or positive",
+        "server.access-token-timeout");
+    testInvalidProperty(
+        Property.POLICY_REFRESH_INTERVAL,
+        "PT-1S",
+        "must be zero or positive",
+        "server.authorization.policy-refresh-interval");
+    testInvalidProperty(
+        Property.POLICY_REFRESH_MIN_PROBE_INTERVAL,
+        "PT-1S",
+        "must be zero or positive",
+        "server.authorization.policy-refresh-min-probe-interval");
+  }
+
+  @Test
+  public void testStorageCleanupConfiguration() {
+    ServerProperties defaults = new ServerProperties();
+    assertThat(defaults.getStorageCleanupPollInterval()).isEqualTo(Duration.ofMinutes(1));
+    assertThat(defaults.getStorageCleanupAttemptTimeout()).isEqualTo(Duration.ofMinutes(30));
+    assertThat(defaults.getStorageCleanupLeaseDuration()).isEqualTo(Duration.ofHours(2));
+    assertThat(defaults.getStorageCleanupInitialDelay()).isEqualTo(Duration.ofDays(7));
+    assertThat(defaults.getStorageCleanupRetryBackoff()).isEqualTo(Duration.ofHours(1));
+
+    testInvalidProperty(
+        Property.STORAGE_CLEANUP_POLL_INTERVAL,
+        "PT0.000000001S",
+        "server.storage-cleanup.poll-interval",
+        "Expected at least one millisecond");
+    Properties leaseTooShort = new Properties();
+    leaseTooShort.setProperty(Property.STORAGE_CLEANUP_ATTEMPT_TIMEOUT.getKey(), "PT20S");
+    leaseTooShort.setProperty(Property.STORAGE_CLEANUP_LEASE_DURATION.getKey(), "PT20S");
+    assertThatThrownBy(() -> new ServerProperties(leaseTooShort))
+        .isInstanceOf(BaseException.class)
+        .hasMessageContaining("lease-duration must exceed the attempt timeout");
+    leaseTooShort.setProperty(Property.STORAGE_CLEANUP_LEASE_DURATION.getKey(), "PT21S");
+    assertThat(new ServerProperties(leaseTooShort).getStorageCleanupLeaseDuration())
+        .isEqualTo(Duration.ofSeconds(21));
+  }
+
+  @Test
+  public void testStorageCredentialCacheConfiguration() {
+    ServerProperties defaults = new ServerProperties();
+    assertThat(defaults.isStorageCredentialCacheEnabled()).isFalse();
+    assertThat(defaults.getStorageCredentialCacheMaxSize()).isEqualTo(1000);
+    assertThat(defaults.getStorageCredentialCacheMaxAge()).isEqualTo(Duration.ofMinutes(5));
+
+    Properties custom = new Properties();
+    custom.setProperty(Property.STORAGE_CREDENTIAL_CACHE_ENABLED.getKey(), "true");
+    custom.setProperty(Property.STORAGE_CREDENTIAL_CACHE_MAX_SIZE.getKey(), "10");
+    custom.setProperty(Property.STORAGE_CREDENTIAL_CACHE_MAX_AGE.getKey(), "PT2M");
+    ServerProperties overridden = new ServerProperties(custom);
+    assertThat(overridden.isStorageCredentialCacheEnabled()).isTrue();
+    assertThat(overridden.getStorageCredentialCacheMaxSize()).isEqualTo(10);
+    assertThat(overridden.getStorageCredentialCacheMaxAge()).isEqualTo(Duration.ofMinutes(2));
+
+    testInvalidProperty(
+        Property.STORAGE_CREDENTIAL_CACHE_MAX_SIZE,
+        "0",
+        "server.storage-credential-cache.max-size");
+    testInvalidProperty(
+        Property.STORAGE_CREDENTIAL_CACHE_MAX_AGE,
+        "PT0S",
+        "server.storage-credential-cache.max-age",
+        "Expected at least one millisecond");
+  }
+
+  @Test
+  public void testReadinessConfiguration() {
+    // Defaults
+    ServerProperties defaults = new ServerProperties();
+    assertThat(defaults.getReadinessProbeInterval()).isEqualTo(Duration.ofSeconds(5));
+    assertThat(defaults.getReadinessDbTimeout()).isEqualTo(Duration.ofSeconds(2));
+
+    // Custom overrides are picked up
+    Properties custom = new Properties();
+    custom.setProperty(Property.READINESS_PROBE_INTERVAL.getKey(), "PT10S");
+    custom.setProperty(Property.READINESS_DB_TIMEOUT.getKey(), "PT3S");
+    ServerProperties overridden = new ServerProperties(custom);
+    assertThat(overridden.getReadinessProbeInterval()).isEqualTo(Duration.ofSeconds(10));
+    assertThat(overridden.getReadinessDbTimeout()).isEqualTo(Duration.ofSeconds(3));
+
+    // Invalid: non-positive and malformed durations are rejected
+    testInvalidProperty(
+        Property.READINESS_PROBE_INTERVAL,
+        "PT0S",
+        "server.readiness.probe-interval",
+        "Expected at least one millisecond");
+    testInvalidProperty(
+        Property.READINESS_DB_TIMEOUT,
+        "2 seconds",
+        "Invalid value '2 seconds'",
+        "server.readiness.db-timeout");
+  }
+
+  @Test
+  public void testShutdownTimeout() {
+    assertThat(new ServerProperties().getShutdownTimeout()).isEqualTo(Duration.ofSeconds(5));
+    testInvalidProperty(
+        Property.SHUTDOWN_TIMEOUT,
+        "PT0S",
+        "server.shutdown-timeout",
+        "Expected at least one millisecond");
+  }
+
+  @Test
+  public void testEffectiveCookieTimeout() {
+    ServerProperties serverProperties = new ServerProperties();
+    assertThat(serverProperties.getEffectiveCookieTimeout()).isEqualTo(Duration.parse("PT24H"));
+
+    serverProperties.set(Property.COOKIE_TIMEOUT, "PT1H");
+    assertThat(serverProperties.getEffectiveCookieTimeout()).isEqualTo(Duration.parse("PT1H"));
+
+    serverProperties.set(Property.ACCESS_TOKEN_TIMEOUT, "PT48H");
+    assertThat(serverProperties.getEffectiveCookieTimeout()).isEqualTo(Duration.parse("PT1H"));
+  }
+
+  @Test
+  public void testSettingsFromEnvironment() {
+    Properties props = new Properties();
+    props.setProperty("server.client-secret", "file-client-secret");
+    props.setProperty("aws.secretKey", "file-aws-secret");
+    props.setProperty("aws.region", "us-west-2");
+    props.setProperty("s3.bucketPath.0", "s3://bucket0");
+    props.setProperty("s3.region.0", "us-west-2");
+    props.setProperty("s3.accessKey.0", "file-access-key");
+    props.setProperty("s3.secretKey.0", "file-s3-secret");
+    props.setProperty("s3.sessionToken.0", "file-session-token");
+    props.setProperty("adls.storageAccountName.0", "account0");
+    props.setProperty("adls.tenantId.0", "tenant");
+    props.setProperty("adls.clientId.0", "client");
+    ServerProperties serverProperties =
+        new ServerProperties(
+            props,
+            Map.of(
+                "UC_SERVER_CLIENT_SECRET", "env-client-secret",
+                // A line break at the end, as in a Secret made from a file, is dropped.
+                "UC_S3_SECRETKEY_0", "env-s3-secret\r\n",
+                "UC_S3_SESSIONTOKEN_0", "env-session-token",
+                "UC_ADLS_CLIENTSECRET_0", "env-adls-secret",
+                "UC_HIBERNATE_CONNECTION_PASSWORD", "env-db-password",
+                // Any key, not only a secret.
+                "UC_S3_REGION_0", "eu-west-1",
+                // An empty variable does not replace the file value.
+                "UC_AWS_SECRETKEY", "",
+                // Without the prefix, a variable that runtimes set themselves is not read.
+                "AWS_REGION", "us-east-1",
+                // A variable named exactly as the key comes first.
+                "s3.accessKey.0", "exact-access-key",
+                "UC_S3_ACCESSKEY_0", "env-access-key"));
+
+    assertThat(serverProperties.get(Property.CLIENT_SECRET)).isEqualTo("env-client-secret");
+    assertThat(serverProperties.get(Property.AWS_SECRET_KEY)).isEqualTo("file-aws-secret");
+    assertThat(serverProperties.get(Property.AWS_REGION)).isEqualTo("us-west-2");
+    assertThat(serverProperties.getEnv("hibernate.connection.password"))
+        .isEqualTo("env-db-password");
+    S3StorageConfig s3 =
+        serverProperties.getS3Configurations().get(NormalizedURL.from("s3://bucket0"));
+    assertThat(s3.getSecretKey()).isEqualTo("env-s3-secret");
+    assertThat(s3.getSessionToken()).isEqualTo("env-session-token");
+    assertThat(s3.getRegion()).isEqualTo("eu-west-1");
+    assertThat(s3.getAccessKey()).isEqualTo("exact-access-key");
+    assertThat(serverProperties.getAdlsConfigurations().get("account0").getClientSecret())
+        .isEqualTo("env-adls-secret");
+  }
+
+  @Test
+  public void testLogsNamesOfSecretsInTheFile(@TempDir Path dir) throws IOException {
+    String file = dir.resolve("server.properties").toString();
+    Files.writeString(
+        Paths.get(file),
+        String.join(
+            "\n",
+            "server.client-secret=client-value",
+            "s3.secretKey.0=s3-value",
+            "s3.sessionToken.0=token-value",
+            "adls.clientSecret.0=adls-value",
+            "hibernate.connection.password=db-value",
+            // An empty line in the sample file is not a secret.
+            "aws.secretKey=",
+            "s3.region.0=us-west-2"));
+    Logger logger = (Logger) LogManager.getLogger(ServerProperties.class);
+    Level previousLevel = logger.getLevel();
+    CapturingAppender appender = new CapturingAppender();
+    appender.start();
+    logger.addAppender(appender);
+    // The test JVM may not find the Log4j config and fall back to ERROR.
+    Configurator.setLevel(logger.getName(), Level.INFO);
+    System.setProperty("adls.clientSecret.0", "property-value");
+    // The server takes the database password only from the environment.
+    System.setProperty("hibernate.connection.password", "property-value");
+    try {
+      ServerProperties serverProperties =
+          new ServerProperties(
+              file,
+              Map.of(
+                  // The server doesn't read the client secret, so this still warns about the file.
+                  "UC_SERVER_CLIENT_SECRET", "env-value",
+                  "UC_S3_SESSIONTOKEN_0", "env-value",
+                  "UC_AWS_REGION", "env-value"));
+      serverProperties.get(Property.AWS_REGION);
+      serverProperties.get(Property.CLIENT_SECRET);
+      assertThat(appender.messages)
+          .satisfiesExactlyInAnyOrder(
+              m ->
+                  assertThat(m)
+                      .startsWith("WARN server.client-secret is set in " + file)
+                      .contains("bin/uc auth login", "UC_SERVER_CLIENT_SECRET"),
+              m -> assertThat(m).startsWith("WARN s3.secretKey.0 is set in " + file),
+              m ->
+                  assertThat(m)
+                      .startsWith("WARN hibernate.connection.password in " + file + " is ignored"),
+              // Once per key, and none for the client secret, which the server doesn't use.
+              m ->
+                  assertThat(m)
+                      .isEqualTo(
+                          "INFO Using the UC_S3_SESSIONTOKEN_0 environment variable for"
+                              + " s3.sessionToken.0"),
+              m ->
+                  assertThat(m)
+                      .isEqualTo(
+                          "INFO Using the UC_AWS_REGION environment variable for aws.region"));
+      System.clearProperty("adls.clientSecret.0");
+      System.clearProperty("hibernate.connection.password");
+
+      // Each kind of secret warns when nothing else supplies it, whatever its index, and the
+      // environment silences the database password.
+      Files.writeString(
+          Paths.get(file),
+          String.join(
+              "\n",
+              "aws.secretKey=a",
+              "s3.secretKey.10=b",
+              "s3.sessionToken.10=c",
+              "adls.clientSecret.10=d",
+              "hibernate.connection.password=e"));
+      new ServerProperties(file, Map.of("UC_HIBERNATE_CONNECTION_PASSWORD", "env-value"));
+      assertThat(appender.messages.subList(5, appender.messages.size()))
+          .filteredOn(m -> m.startsWith("WARN"))
+          .extracting(m -> m.split(" ")[1])
+          .containsExactlyInAnyOrder(
+              "aws.secretKey", "s3.secretKey.10", "s3.sessionToken.10", "adls.clientSecret.10");
+      assertThat(String.join("\n", appender.messages))
+          .doesNotContain(
+              "client-value", "s3-value", "token-value", "adls-value", "db-value", "env-value");
+    } finally {
+      System.clearProperty("adls.clientSecret.0");
+      System.clearProperty("hibernate.connection.password");
+      logger.removeAppender(appender);
+      Configurator.setLevel(logger.getName(), previousLevel);
+      appender.stop();
+    }
+  }
+
+  private static final class CapturingAppender extends AbstractAppender {
+
+    private final List<String> messages = new CopyOnWriteArrayList<>();
+
+    private CapturingAppender() {
+      super(
+          "ServerPropertiesTest",
+          null,
+          null,
+          true,
+          org.apache.logging.log4j.core.config.Property.EMPTY_ARRAY);
+    }
+
+    @Override
+    public void append(LogEvent event) {
+      messages.add(event.getLevel() + " " + event.getMessage().getFormattedMessage());
+    }
+  }
+
+  @Test
+  public void testDefaultPropertyValues() {
+    // Test that all default values are valid and correctly set. If any of them are invalid, the
+    // constructor would throw exception.
+    ServerProperties serverProperties = new ServerProperties();
+    for (Property property : Property.values()) {
+      if (property.getDefaultValue() != null) {
+        assertThat(serverProperties.get(property)).isEqualTo(property.getDefaultValue());
+      }
+    }
+
+    // Test that properties from etc/conf/server.properties match the default values.
+    // If you have modified values in file server.properties, please also update ServerProperties.
+    ServerProperties serverPropertiesFromConf = new ServerProperties("etc/conf/server.properties");
+    for (Property property : Property.values()) {
+      // Compare values - both should have the same defaults
+      assertThat(serverPropertiesFromConf.get(property))
+          .as("Property %s from etc/conf/server.properties should match default", property.getKey())
+          .isEqualTo(serverProperties.get(property));
+    }
+  }
+
+  @Test
+  public void testCheckDeltaApiOnlyForManagedTable() {
+    ServerProperties serverProperties1 = new ServerProperties();
+    serverProperties1.checkDeltaApiOnlyForManagedTable(TableType.MANAGED, "endpoint_name");
+    serverProperties1.checkDeltaApiOnlyForManagedTable(TableType.EXTERNAL, "endpoint_name");
+    serverProperties1.checkDeltaApiOnlyForManagedTable(TableType.METRIC_VIEW, "endpoint_name");
+    serverProperties1.checkDeltaApiOnlyEnabled("endpoint_name");
+
+    Properties props = new Properties();
+    props.setProperty(Property.MANAGED_TABLE_USE_DELTA_API_ONLY.getKey(), "true");
+    ServerProperties serverProperties2 = new ServerProperties(props);
+    serverProperties2.checkDeltaApiOnlyForManagedTable(TableType.EXTERNAL, "endpoint_name");
+    serverProperties2.checkDeltaApiOnlyForManagedTable(TableType.METRIC_VIEW, "endpoint_name");
+    assertThatThrownBy(
+            () ->
+                serverProperties2.checkDeltaApiOnlyForManagedTable(
+                    TableType.MANAGED, "endpoint_name"))
+        .isInstanceOf(BaseException.class)
+        .hasMessageContaining("endpoint is disabled for MANAGED Delta tables when");
+    assertThatThrownBy(() -> serverProperties2.checkDeltaApiOnlyEnabled("endpoint_name"))
+        .isInstanceOf(BaseException.class)
+        .hasMessageContaining("endpoint is disabled when");
+  }
+
+  @Test
+  public void testWildcardAudienceConfiguration() {
+    Properties wildcardOnly = new Properties();
+    wildcardOnly.setProperty("server.audiences", "*");
+    ServerProperties props = new ServerProperties(wildcardOnly);
+    assertThat(props.isAudienceValidationDisabled()).isTrue();
+
+    Properties mixed = new Properties();
+    mixed.setProperty("server.audiences", "*,unity-catalog-local");
+    assertThatThrownBy(() -> new ServerProperties(mixed))
+        .isInstanceOf(BaseException.class)
+        .hasMessageContaining("cannot combine '*' with other values");
+  }
+
+  @Test
+  public void testRejectsLoneWildcardAllowedIssuers() {
+    Properties props = new Properties();
+    props.setProperty("server.allowed-issuers", "*");
+    assertThatThrownBy(() -> new ServerProperties(props))
+        .isInstanceOf(BaseException.class)
+        .hasMessageContaining("server.allowed-issuers cannot be '*'");
+  }
+
+  @Test
+  public void testAllowlistCaching() {
+    Properties props = new Properties();
+    props.setProperty("server.allowed-issuers", "https://a.example.com");
+    ServerProperties serverProperties = new ServerProperties(props);
+
+    WildcardAllowlist first = serverProperties.getIssuerAllowlist();
+    WildcardAllowlist second = serverProperties.getIssuerAllowlist();
+    assertThat(first).isSameAs(second);
+    assertThat(first.isAllowed("https://a.example.com")).isTrue();
+  }
+
+  @Test
+  public void testAllowlistRebuildsWhenPropertyChanges() {
+    Properties props = new Properties();
+    props.setProperty("server.allowed-issuers", "https://a.example.com");
+    ServerProperties serverProperties = new ServerProperties(props);
+    WildcardAllowlist original = serverProperties.getIssuerAllowlist();
+
+    System.setProperty("server.allowed-issuers", "https://b.example.com");
+    try {
+      WildcardAllowlist rebuilt = serverProperties.getIssuerAllowlist();
+      assertThat(rebuilt).isNotSameAs(original);
+      assertThat(rebuilt.isAllowed("https://b.example.com")).isTrue();
+      assertThat(rebuilt.isAllowed("https://a.example.com")).isFalse();
+    } finally {
+      System.clearProperty("server.allowed-issuers");
+    }
+  }
+}

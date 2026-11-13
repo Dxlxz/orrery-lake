@@ -1,0 +1,153 @@
+package io.unitycatalog.server.persist;
+
+import io.unitycatalog.server.persist.dao.StorageCleanupTaskDAO;
+import io.unitycatalog.server.persist.utils.TransactionManager;
+import io.unitycatalog.server.utils.NormalizedURL;
+import io.unitycatalog.server.utils.ValidationUtils;
+import java.sql.Timestamp;
+import java.time.Duration;
+import java.util.Date;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+import org.hibernate.Session;
+import org.hibernate.SessionFactory;
+
+/** Persists cleanup tasks using the database clock for all task timestamps. */
+public class StorageCleanupTaskRepository implements CleanupTaskRepository {
+  private final SessionFactory sessionFactory;
+
+  public StorageCleanupTaskRepository(SessionFactory sessionFactory) {
+    this.sessionFactory = sessionFactory;
+  }
+
+  @Override
+  public StorageCleanupTaskDAO create(
+      Session session,
+      ManagedResourceType resourceType,
+      UUID resourceId,
+      String resourceName,
+      String storageLocation) {
+    StorageCleanupTaskDAO task =
+        StorageCleanupTaskDAO.builder()
+            .resourceType(resourceType)
+            .id(resourceId)
+            .name(resourceName)
+            .storageLocation(NormalizedURL.normalize(storageLocation))
+            .deletedAt(currentDatabaseTime(session))
+            .build();
+    session.persist(task);
+    return task;
+  }
+
+  @Override
+  public Optional<Claim> claim(Duration leaseDuration, Duration initialDelay) {
+    ValidationUtils.checkArgument(
+        leaseDuration.compareTo(Duration.ofMillis(1)) >= 0,
+        "Lease duration must be at least one millisecond");
+    ValidationUtils.checkArgument(
+        !initialDelay.isNegative(), "Initial cleanup delay cannot be negative");
+    UUID leaseToken = UUID.randomUUID();
+    return TransactionManager.executeWithTransaction(
+        sessionFactory,
+        session -> {
+          Timestamp now = currentDatabaseTime(session);
+          // Keep sub-millisecond precision: deletedAt is stored from CURRENT_TIMESTAMP, so a Date
+          // (millisecond) cutoff would sit below a task deleted earlier in the same millisecond and
+          // skip it. Timestamp.from preserves the database's microseconds that Date.from truncates.
+          Timestamp cutoff = Timestamp.from(now.toInstant().minus(initialDelay));
+          Optional<StorageCleanupTaskDAO> readyTask =
+              session
+                  .createQuery(
+                      "FROM StorageCleanupTaskDAO WHERE deletedAt <= :cutoff "
+                          + "AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= :now) "
+                          + "ORDER BY COALESCE(leaseExpiresAt, deletedAt)",
+                      StorageCleanupTaskDAO.class)
+                  .setParameter("cutoff", cutoff)
+                  .setParameter("now", now)
+                  .setMaxResults(1)
+                  .uniqueResultOptional();
+          if (readyTask.isEmpty()) {
+            return Optional.empty();
+          }
+          StorageCleanupTaskDAO task = readyTask.get();
+          Date expires = Date.from(now.toInstant().plus(leaseDuration));
+          int updated =
+              session
+                  .createMutationQuery(
+                      "UPDATE StorageCleanupTaskDAO SET leaseToken = :token, "
+                          + "leaseExpiresAt = :expires WHERE id = :id "
+                          + "AND storageLocation = :location "
+                          + "AND deletedAt <= :cutoff "
+                          + "AND (leaseExpiresAt IS NULL OR leaseExpiresAt <= :now)")
+                  .setParameter("token", leaseToken)
+                  .setParameter("expires", expires)
+                  .setParameter("id", task.getId())
+                  .setParameter("location", task.getStorageLocation())
+                  .setParameter("cutoff", cutoff)
+                  .setParameter("now", now)
+                  .executeUpdate();
+          return updated == 1
+              ? Optional.of(
+                  new Claim(
+                      task.getResourceType(), task.getId(), task.getStorageLocation(), leaseToken))
+              : Optional.empty();
+        },
+        "Failed to claim storage cleanup task",
+        /* readOnly= */ false);
+  }
+
+  @Override
+  public boolean reportFailure(UUID resourceId, UUID leaseToken, CleanupFailureReport report) {
+    Objects.requireNonNull(report, "report");
+    String error =
+        report.sanitizedError().substring(0, Math.min(report.sanitizedError().length(), 2048));
+    return TransactionManager.executeWithTransaction(
+        sessionFactory,
+        session -> {
+          Timestamp now = currentDatabaseTime(session);
+          Date nextAttempt = Date.from(now.toInstant().plus(report.retryBackoff()));
+          var query =
+              session
+                  .createMutationQuery(
+                      "UPDATE StorageCleanupTaskDAO SET leaseToken = NULL, "
+                          + "leaseExpiresAt = :nextAttempt, failureCount = failureCount + 1, "
+                          + "lastError = :error WHERE id = :id AND leaseToken = :token "
+                          + "AND leaseExpiresAt > :now")
+                  .setParameter("nextAttempt", nextAttempt)
+                  .setParameter("id", resourceId)
+                  .setParameter("token", leaseToken)
+                  .setParameter("now", now);
+          query.setParameter("error", error);
+          return query.executeUpdate() == 1;
+        },
+        "Failed to update storage cleanup task",
+        /* readOnly= */ false);
+  }
+
+  @Override
+  public boolean finish(UUID resourceId, UUID leaseToken) {
+    return TransactionManager.executeWithTransaction(
+        sessionFactory,
+        session -> {
+          Timestamp now = currentDatabaseTime(session);
+          return session
+                  .createMutationQuery(
+                      "DELETE FROM StorageCleanupTaskDAO WHERE id = :id "
+                          + "AND leaseToken = :token AND leaseExpiresAt > :now")
+                  .setParameter("id", resourceId)
+                  .setParameter("token", leaseToken)
+                  .setParameter("now", now)
+                  .executeUpdate()
+              == 1;
+        },
+        "Failed to complete storage cleanup task",
+        /* readOnly= */ false);
+  }
+
+  // Package-private and non-static so a test can stub the database clock (via a Mockito spy) to
+  // pin sub-millisecond precision deterministically.
+  Timestamp currentDatabaseTime(Session session) {
+    return session.createQuery("SELECT CURRENT_TIMESTAMP", Timestamp.class).getSingleResult();
+  }
+}

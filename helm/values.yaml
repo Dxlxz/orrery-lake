@@ -1,0 +1,1078 @@
+storage:
+  # -- (string) Root path for the model storage
+  # @default -- not set
+  # @raw
+  #
+  # Example: `s3://bucket/path`
+  #
+  modelStorageRoot: file:/tmp/ucroot
+
+  credentials:
+    # -- (array) S3 credentials for accessing the storage
+    # @default -- not set
+    # @raw
+    #
+    # Example:
+    # ```yaml
+    # s3:
+    # - bucketPath: s3://my-bucket-path
+    #   region: us-east-1
+    #   awsRoleArn: arn:aws:iam::123456789012:role/my-role
+    #   credentialsSecretName: my-bucket-secret
+    # ```
+    #
+    # Credential secret must contain the following keys:
+    # - `accessKey`: AWS access key
+    # - `secretKey`: AWS secret key
+    #
+    s3:
+
+    # -- (array) ADLS credentials for accessing the storage
+    # @default -- not set
+    # @raw
+    #
+    # Example:
+    # ```yaml
+    # adls:
+    # - storageAccountName: my-storage-account
+    #   credentialsSecretName: my-storage-secret
+    # ```
+    #
+    # Credential secret must contain the following keys:
+    # - `tenantId`: Azure tenant ID
+    # - `clientId`: Azure client ID
+    # - `clientSecret`: Azure client secret
+    #
+    adls:
+
+    # -- (array) GCS credentials for accessing the storage
+    # @default -- not set
+    # @raw
+    #
+    # Example:
+    # ```yaml
+    # gcs:
+    # - bucketPath: gs://my-bucket-name
+    #   credentialsSecretName: my-bucket-secret
+    # ```
+    #
+    # Credential secret must contain the following keys:
+    # - `jsonKey`: GCP service account JSON key
+    #
+    gcs:
+
+auth:
+  # -- (bool) Enable OAuth authentication
+  enabled: false
+
+  # -- (array) List of users to be created in the system
+  # @default -- not set
+  # @notationType -- yaml
+  # @raw
+  #
+  # TODO: It is not possible to create proper admin account. This is a workaround.
+  #
+  # Example:
+  # ```yaml
+  # users:
+  # - name: admin
+  #   email: test@example.com
+  #   canCreateCatalogs: true    # Optional (default: false)
+  # ```
+  #
+  users:
+
+  # -- (string) OAuth provider
+  # @default -- google
+  # @raw
+  #
+  # Supported values: `google`, `other`
+  #
+  # other: Use this option if you want to use a custom OAuth provider. UI does not have any built-in support for this option.
+  #
+  provider: google
+
+  # -- (string) OAuth authorization URL
+  # @default -- https://accounts.google.com/o/oauth2/auth
+  # @raw
+  #
+  # Example: `https://accounts.google.com/o/oauth2/auth`
+  #
+  authorizationUrl: https://accounts.google.com/o/oauth2/auth
+
+  # -- (string) OAuth token URL
+  # @default -- https://oauth2.googleapis.com/token
+  # @raw
+  #
+  # Example: `https://oauth2.googleapis.com/token`
+  #
+  tokenUrl: https://oauth2.googleapis.com/token
+
+  # -- (string) OAuth client secret name
+  # @default -- not set
+  # @raw
+  #
+  # Client secret must contain the following key:
+  # - `clientId`: OAuth client ID
+  #
+  # The server doesn't read the OAuth client secret. A `clientSecret` key is passed only to a
+  # `server.config.override` or `extraProperties` template that uses `${OAUTH_CLIENT_SECRET}`.
+  #
+  clientSecretName:
+
+  # -- (string) Comma-separated list of allowed token issuers
+  # @default -- https://accounts.google.com
+  # @raw
+  #
+  # When authorization is enabled, tokens will only be accepted from issuers in this list.
+  # Supports exact match or wildcard patterns with * (single DNS label per wildcard).
+  # Cannot be "*" alone. Wildcard issuers are evaluated before signature verification;
+  # see docs/server/auth.md.
+  #
+  # Example for Google: `https://accounts.google.com`
+  # Example for Microsoft Entra ID: `https://login.microsoftonline.com/{tenant-id}/v2.0`
+  #
+  allowedIssuers: https://accounts.google.com
+
+  # -- (string) Comma-separated list of exact JWKS URLs allowed on other origins
+  # @default -- https://www.googleapis.com/oauth2/v3/certs
+  # @raw
+  #
+  # Match each provider's discovery URL, including any explicit port. Wildcards are not supported.
+  #
+  allowedJwksUris: https://www.googleapis.com/oauth2/v3/certs
+
+  # -- (string) Comma-separated list of expected JWT audience values
+  # @default -- not set
+  # @raw
+  #
+  # When authorization is enabled, tokens must contain an aud value matching one of these entries.
+  # Supports exact match or wildcard patterns with * (same rules as allowedIssuers).
+  # Use "*" alone to disable audience validation (issuer and user checks still apply).
+  #
+  audiences:
+
+  # -- (int) OAuth redirect port
+  # @default -- not set
+  redirectPort:
+
+  # -- (string) OAuth cookie timeout
+  # @raw
+  #
+  # Example: `P5D` (5 days)
+  #
+  cookieTimeout: P5D
+
+  # -- (string) UC access token lifetime for token exchange
+  # @default -- PT24H
+  # @raw
+  #
+  # Example: `PT24H` (24 hours), `P7D` (7 days)
+  #
+  accessTokenTimeout: PT24H
+
+server:
+  # -- (bool) Enable the server deployment
+  enabled: true
+
+  db:
+    # -- (string) Database type
+    # @raw
+    #
+    # Supported values: `file`, `postgresql`, `mysql`
+    #
+    type: file
+    fileConfig:
+      persistence:
+        # -- (bool) Enable persistence for the file database volume
+        # @raw
+        #
+        # If set to false, all data will be lost when the pod is deleted
+        #
+        enabled: true
+
+        # -- (string) Name of the file database persistence volume claim
+        # @default -- derived from the chart parameters and metadata
+        pvcName:
+
+        # -- (bool) Create a new file database volume if it does not exist
+        createPVC: true
+
+        # -- (array) Access modes for the file database volume
+        accessModes: ["ReadWriteOnce"]
+
+        # -- (string) Size of the file database volume
+        # @raw
+        #
+        # Example: `1Gi`
+        #
+        size: 1Gi
+
+        # -- (string) Storage class for the file database volume
+        # @default -- not set
+        # @raw
+        #
+        # If not set, the default storage class will be used
+        #
+        storageClassName:
+
+    postgresqlConfig:
+      # -- (string) PostgreSQL database host (Required)
+      # @default -- not set
+      # @raw
+      #
+      # Example: `mydb.123456789012.us-east-1.rds.amazonaws.com`
+      #
+      host:
+
+      # -- (int) PostgreSQL database port
+      # @default -- 5432
+      port: 5432
+
+      # -- (string) PostgreSQL database name
+      # @default -- ucdb
+      dbName: ucdb
+
+      # -- (string) PostgreSQL username
+      # @default -- postgres
+      username: postgres
+
+      # -- (string) PostgreSQL user password secret name
+      # @default -- not set
+      # @raw
+      #
+      # If not set, connection will be made without a password
+      #
+      passwordSecretName:
+
+      # -- (string) PostgreSQL user password secret key
+      # @default -- password
+      passwordSecretKey: password
+
+      ssl:
+        enabled: false
+        # -- (string) PostgreSQL SSL mode
+        # @default -- verify-full
+        # @raw
+        #
+        # [Documentation](https://jdbc.postgresql.org/documentation/ssl/)
+        #
+        mode: verify-full
+
+        # -- (string) PostgreSQL SSL root certificate
+        # @default -- public root CAs
+        # @raw
+        #
+        # Example:
+        # ```yaml
+        # rootCert: |
+        #   -----BEGIN CERTIFICATE-----
+        #   ...certificate data...
+        #   -----END CERTIFICATE-----
+        # ```
+        #
+        rootCert:
+
+        # -- (string) PostgreSQL SSL root certificate config map name
+        # @default -- not set
+        rootCertConfigMapName:
+
+        # -- (string) PostgreSQL SSL root certificate config map key
+        # @default -- ca.crt
+        rootCertConfigMapKey: ca.crt
+
+      # -- (object) Postgres params
+      # @default -- not set
+      # @raw
+      #
+      # Example:
+      # ```yaml
+      # params:
+      #   sslfactory: my.custom.SSLFactory
+      # ```
+      #
+      extraParams:
+
+    mysqlConfig:
+      # -- (string) MySQL database host (Required)
+      # @default -- not set
+      host:
+
+      # -- (int) MySQL database port
+      # @default -- 3306
+      port: 3306
+
+      # -- (string) MySQL database name
+      # @default -- ucdb
+      dbName: ucdb
+
+      # -- (string) MySQL username
+      # @default -- root
+      username: root
+
+      # -- (string) MySQL user password secret name
+      # @default -- not set
+      # @raw
+      #
+      # If not set, connection will be made without a password
+      #
+      passwordSecretName:
+
+      # -- (string) MySQL user password secret key
+      # @default -- password
+      passwordSecretKey: password
+
+      # -- (object) MySQL JDBC URL params
+      # @default -- not set
+      # @raw
+      #
+      # Example:
+      # ```yaml
+      # extraParams:
+      #   sslMode: VERIFY_IDENTITY
+      # ```
+      #
+      extraParams:
+
+      driver:
+        # -- (object) Volume that holds the MySQL JDBC driver jar (Required)
+        # @default -- not set
+        # @raw
+        #
+        # The server image does not include the MySQL JDBC driver
+        # ([MySQL Connector/J](https://dev.mysql.com/downloads/connector/j/)), because it is licensed under the GPL;
+        # the PostgreSQL driver it does include is BSD-licensed. The chart mounts the jar at `subPath` in this volume
+        # into the server and puts it on the Java module path. Any volume source works, for example a
+        # PersistentVolumeClaim. The driver jar is larger than a ConfigMap can hold.
+        #
+        # Example:
+        # ```yaml
+        # volume:
+        #   persistentVolumeClaim:
+        #     claimName: mysql-driver
+        # ```
+        #
+        volume:
+
+        # -- (string) Path of the driver jar in `volume` (Required)
+        # @default -- not set
+        # @raw
+        #
+        # To change the driver version, put the new jar on the volume and point `subPath` at it.
+        #
+        # Example: `mysql-connector-j-8.4.0.jar`
+        #
+        subPath:
+
+    # -- (string) Override Hibernate configuration for the server
+    # @default -- not set
+    # @raw
+    #
+    # Do not put the password here: set `passwordSecretName` and `passwordSecretKey` of the
+    # database's config; with `db.type: postgresql` or `mysql` the chart passes the password to the
+    # server as an environment variable. A password in `hibernate.properties` is deprecated.
+    # If the template sets `hibernate.connection.password=${DB_PASSWORD}`, remove that line: the
+    # server reads the password from `UC_HIBERNATE_CONNECTION_PASSWORD`.
+    #
+    overrideConfig:
+
+  config:
+    # -- (string) Server configuration template override
+    # @default -- not set
+    # @raw
+    #
+    # Example:
+    # ```
+    # server.env=prod
+    # server.port=8080
+    # ...other config properties...
+    # ```
+    #
+    # Do not put secrets here: the chart passes the S3 and ADLS secrets to the server as environment
+    # variables, and a secret in `server.properties` is deprecated. A template that uses `${OAUTH_CLIENT_SECRET}`,
+    # `${S3_SECRET_KEY_<n>}` or `${ADLS_CLIENT_SECRET_<n>}` still gets them, but that is deprecated
+    # too: the server reads `UC_S3_SECRETKEY_<n>` and `UC_ADLS_CLIENTSECRET_<n>` from its environment.
+    #
+    override:
+
+    # -- (object) Extra config properties that will be added to server.properties
+    # @default -- not set
+    # @raw
+    #
+    # Example:
+    # ```yaml
+    # extraProperties:
+    #   my-config.property1: my-value1
+    #   my-config.property2: my-value2
+    # ```
+    #
+    # Do not put secrets here: a secret in `server.properties` is deprecated.
+    #
+    extraProperties:
+
+  # -- (string) Server hibernate configuration template override
+  # @default -- not set
+  # @raw
+  #
+  # Example:
+  # ```
+  # hibernate.dialect=org.hibernate.dialect.MySQLDialect
+  # hibernate.connection.driver_class=com.mysql.cj.jdbc.Driver
+  # ...other hibernate config properties...
+  # ```
+  #
+  hibernateConfigOverride:
+
+  service:
+    # -- (string) Service type for the server
+    type: ClusterIP
+    # -- (int) Service port for the server
+    port: 8080
+
+  deployment:
+    # -- (int) Number of replicas
+    # @raw
+    #
+    # For replica count higher than 1 - use an external database
+    #
+    replicaCount: 1
+
+    # -- (int) Port the server listens on for API requests
+    port: 8080
+
+    # -- (int) Observability port for the server deployment
+    # @default -- not set (observability off)
+    # @raw
+    #
+    # When set, the server starts with `--obs-port` and serves `/livez`, `/readyz` and `/metrics`
+    # on this port, without authentication. The readiness and liveness probes, when turned on,
+    # then check `/readyz` and `/livez`; without it they check that the API port accepts a
+    # connection. The Service doesn't expose the port, but other pods can reach it
+    # on the pod IP; restrict it with a NetworkPolicy if needed, and allow the kubelet to reach it
+    # for the probes. Must differ from `port`. Needs server image v0.7.0 or later.
+    #
+    obsPort:
+
+    initContainer:
+      image:
+        # -- (string) Repository for the render config container
+        repository: alpine
+        # -- (string) Pull policy for the render config container
+        pullPolicy: IfNotPresent
+        # -- (string) Tag for the render config container, pinned by digest
+        tag: "3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6"
+
+      # -- (object) Security context for the init container
+      # @default -- not set
+      # @raw
+      #
+      # [Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+      #
+      securityContext:
+
+    image:
+      # -- (string) Repository for the server image
+      repository: Dxlxz/orrery-lake
+      # -- (string) Pull policy for the server image
+      pullPolicy: IfNotPresent
+      # -- (string) Tag for the server image
+      # @default -- {{ .Chart.AppVersion }}
+      # @raw
+      #
+      # Use the server image from the same release as the chart. The chart passes secrets to
+      # the server as environment variables that older server images don't read.
+      #
+      tag:
+
+    # -- (array) Command that starts the server
+    # @raw
+    #
+    # The chart passes `--port`, and `--obs-port` when `obsPort` is set, as the container's `args`.
+    # Kubernetes runs this command instead of the image's `ENTRYPOINT`, so an image that starts
+    # through its own wrapper can set it here; the wrapper must pass the arguments on to
+    # `./bin/start-uc-server`.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/inject-data-application/define-command-argument-container/)
+    #
+    command:
+      - ./bin/start-uc-server
+
+    # -- (array) Image pull secrets for the server
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod)
+    #
+    imagePullSecrets:
+
+    # -- (array) List of additional init containers to be added to the server pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+    #
+    extraInitContainers:
+
+    # -- (array) List of additional containers to be added to the server pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+    #
+    extraContainers:
+
+    # -- (object) Additional annotations for the pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+    #
+    extraPodAnnotations:
+
+    # -- (object) Additional labels for the pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/)
+    #
+    extraPodLabels:
+
+    # -- (object) Security context for the pod
+    # @raw
+    #
+    # By default, the pod security context has `fsGroup` set to `101` to allow the container
+    # to write to the mounted volumes.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+    #
+    podSecurityContext:
+      fsGroup: 101
+
+    # -- (object) Security context for the container
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+    #
+    securityContext:
+
+    # -- (object) Resources for the deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+    #
+    resources:
+
+    # -- (object) Lifecycle hooks for the server container
+    # @default -- not set
+    # @raw
+    #
+    # On SIGTERM the server stops taking new requests and finishes the ones in flight, for up to
+    # the `server.shutdown-timeout` server property (set under `server.config.extraProperties`).
+    # Kubernetes can still route requests to the pod for a few seconds after it starts terminating,
+    # so a `preStop` sleep keeps the server serving until they stop arriving:
+    #
+    # ```yaml
+    # lifecycle:
+    #   preStop:
+    #     exec:
+    #       command: ["sleep", "10"]
+    # ```
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
+    #
+    lifecycle:
+
+    # -- (int) Seconds Kubernetes waits for the pod to stop before killing it
+    # @default -- not set (Kubernetes uses 30)
+    # @raw
+    #
+    # Set it to more than the `preStop` sleep plus the whole shutdown time. The `server.shutdown-timeout`
+    # entry in the server configuration reference describes it: the timeout plus time for storage
+    # cleanup and for stopping the HTTP server.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)
+    #
+    terminationGracePeriodSeconds:
+
+    # -- (array) List of additional volumes to be mounted in the pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+    #
+    extraVolumes:
+
+    # -- (array) List of additional volume mounts for the pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+    #
+    extraVolumeMounts:
+
+    # -- (object) Node selector for the deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+    #
+    nodeSelector:
+
+    # -- (array) Tolerations for the deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+    #
+    tolerations:
+
+    # -- (object) Node affinity for the deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+    #
+    affinity:
+
+    # -- (object) Update strategy for the deployment
+    # @default -- # If replicaCount: 1 and db type "file"<br>type: Recreate<br># Else<br>type: RollingUpdate
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)
+    #
+    updateStrategy:
+
+    # -- (bool) Enable liveness probe
+    # @raw
+    #
+    # If set to true, the liveness probe will be enabled.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    enableLivenessProbe: false
+
+    # -- (object) Liveness probe
+    # @default -- with obsPort: httpGet `/livez` on port obs; otherwise tcpSocket on port api. timeoutSeconds: 10, periodSeconds: 10, failureThreshold: 30 (5 minutes)
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    livenessProbe:
+
+    # -- (bool) Enable readiness probe
+    # @raw
+    #
+    # If set to true, the readiness probe will be enabled.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    enableReadinessProbe: false
+
+    # -- (object) Readiness probe
+    # @default -- with obsPort: httpGet `/readyz` on port obs, failureThreshold: 3; otherwise tcpSocket on port api, failureThreshold: 30 (5 minutes). timeoutSeconds: 10, periodSeconds: 10
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    readinessProbe:
+
+    # -- (bool) Enable startup probe
+    # @raw
+    #
+    # If set to true, the startup probe will be enabled.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    enableStartupProbe: true
+
+    # -- (object) Startup probe
+    # @default -- tcpSocket:<br>  port: api<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    startupProbe:
+
+  createUsersJob:
+    image:
+      # -- (string) Repository for the create users job image
+      repository: alpine
+      # -- (string) Pull policy for the create users job image
+      pullPolicy: IfNotPresent
+      # -- (string) Tag for the create users job image, pinned by digest
+      tag: "3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6"
+
+    # -- (object) Additional annotations for the create users job
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+    #
+    extraAnnotations:
+
+    # -- (int) TTL for the create users job (in seconds)
+    # @default -- 300
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/ttlafterfinished/)
+    #
+    ttlSecondsAfterFinished: 300
+
+    # -- (int) Backoff limit for the create users job
+    # @default -- 5
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/jobs-run-to-completion/)
+    #
+    backoffLimit: 5
+
+  jwtKeypairSecret:
+    # -- (string) Name of the keypair secret for JWT signing
+    # @default -- derived from the chart parameters and metadata
+    # @raw
+    #
+    # The secret must contain the following keys:
+    # - `private_key.der` or `private_key.pem`: Private key in DER or PEM format
+    # - `key_id.txt`: Key ID
+    #
+    # [Kubernetes docs](https://github.com/Dxlxz/orrery-lake/blob/main/server/src/main/java/io/unitycatalog/server/security/SecurityConfiguration.java)
+    #
+    name:
+
+    # -- (bool) Create keypair secret
+    # @raw
+    #
+    # If set to true, the secret will be created with a random keypair
+    #
+    create: true
+
+  # -- (string) Log level for the server
+  # @default -- info
+  logLevel: info
+
+ui:
+  # -- (bool) Enable the UI
+  enabled: true
+
+  service:
+    # -- (string) Service type for the UI
+    type: ClusterIP
+    # -- (int) Service port for the UI
+    port: 3000
+
+  # -- (bool) Enable proxy API requests
+  # @default -- `false`, if using ingress or httpRoute, otherwise `true`
+  # @raw
+  #
+  # If set to true, the UI will proxy API requests to the server.
+  # It will only accept requests from the server with the host header `localhost`.
+  # For production deployment with a load balancer that routes traffic to the UI and server, set this to false.
+  #
+  proxyApiRequests:
+
+  # -- (tpl/string) Server URL for the UI to connect to
+  # @default -- http://{{ include "unitycatalog.server.fullname" . }}:{{ .Values.server.service.port }}
+  # @raw
+  #
+  # The server URL is used by the UI to connect to the server.
+  # The default value is set to the server service URL.
+  #
+  serverUrl: http://{{ include "unitycatalog.server.fullname" . }}:{{ .Values.server.service.port }}
+
+  deployment:
+    # -- (int) Port for the UI deployment
+    port: 3000
+
+    # -- (int) Replica count for the UI deployment
+    replicaCount: 1
+
+    initContainer:
+      image:
+        # -- (string) Repository for the UI init container
+        repository: busybox
+        # -- (string) Pull policy for the UI init container
+        pullPolicy: IfNotPresent
+        # -- (string) Tag for the UI init container, pinned by digest
+        tag: "1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+
+      # -- (object) Security context for the init container
+      # @default -- not set
+      # @raw
+      #
+      # [Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+      #
+      securityContext:
+
+    image:
+      # -- (string) Repository for the UI image
+      repository: Dxlxz/orrery-lake-ui
+      # -- (string) Pull policy for the UI image
+      pullPolicy: IfNotPresent
+
+      # -- (string) Tag for the UI image
+      # @default -- {{ .Chart.AppVersion }}
+      tag:
+
+    # -- (array) Image pull secrets for the UI
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod)
+    #
+    imagePullSecrets:
+
+    # -- (array) List of additional init containers to be added to the UI pods
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+    #
+    extraInitContainers:
+
+    # -- (array) List of additional containers to be added to the UI pods
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/pods/#pod)
+    #
+    extraContainers:
+
+    # -- (object) Additional annotations for the UI pods
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/)
+    #
+    extraPodAnnotations:
+
+    # -- (object) Additional labels for the UI pods
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+    #
+    extraPodLabels:
+
+    # -- (object) Security context for the UI pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+    #
+    podSecurityContext:
+
+    # -- (object) Security context for the UI container
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/policy/security-context/)
+    #
+    securityContext:
+
+    # -- (object) Resources for the UI deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+    #
+    resources:
+
+    # -- (bool) Enable liveness probe
+    # @raw
+    #
+    # If set to true, the liveness probe will be enabled.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    enableLivenessProbe: false
+
+    # -- (object) Liveness probe
+    # @default -- tcpSocket:<br>  port: ui<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    livenessProbe:
+
+    # -- (bool) Enable readiness probe
+    # @raw
+    #
+    # If set to true, the readiness probe will be enabled.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    enableReadinessProbe: false
+
+    # -- (object) Readiness probe
+    # @default -- tcpSocket:<br>  port: ui<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    readinessProbe:
+
+    # -- (bool) Enable startup probe
+    # @raw
+    #
+    # If set to true, the startup probe will be enabled.
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    enableStartupProbe: true
+
+    # -- (object) Startup probe
+    # @default -- tcpSocket:<br>  port: ui<br>timeoutSeconds: 10<br>periodSeconds: 10<br>failureThreshold: 30 # 5 minutes
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+    #
+    startupProbe:
+
+    # -- (array) List of additional volumes to be mounted in the pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+    #
+    extraVolumes:
+
+    # -- (array) List of additional volume mounts for the pod
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/storage/volumes/)
+    #
+    extraVolumeMounts:
+
+    # -- (object) Node selector for the UI deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+    #
+    nodeSelector:
+
+    # -- (array) Tolerations for the UI deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/)
+    #
+    tolerations:
+
+    # -- (object) Node affinity for the UI deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
+    #
+    affinity:
+
+    # -- (object) Update strategy for the deployment
+    # @default -- not set
+    # @raw
+    #
+    # [Kubernetes docs](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#updating-a-deployment)
+    #
+    updateStrategy:
+
+test:
+  image:
+    # -- (string) Repository for the `helm test` pod image
+    repository: busybox
+    # -- (string) Pull policy for the `helm test` pod image
+    pullPolicy: IfNotPresent
+    # -- (string) Tag for the `helm test` pod image, pinned by digest
+    tag: "1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+
+  # -- (array) Image pull secrets for the `helm test` pod
+  # @default -- not set
+  # @raw
+  #
+  # [Kubernetes docs](https://kubernetes.io/docs/concepts/containers/images/#specifying-imagepullsecrets-on-a-pod)
+  #
+  imagePullSecrets:
+
+# -- (string) Override the name used in resource names
+# @default -- unitycatalog
+nameOverride:
+# -- (string) Override the full name of the chart
+# @default -- derived from the release name and nameOverride
+fullnameOverride:
+
+
+ingress:
+  # -- (bool) Enable ingress for the server
+  # @raw
+  #
+  # [Kubernetes docs](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+  #
+  enabled: false
+
+  # -- (string) Ingress host configuration (Required for TLS)
+  # @default -- not set
+  host:
+
+  # -- (string) Ingress class name
+  # @default -- default ingress class
+  ingressClassName:
+
+  # -- (object) Ingress annotations
+  # @default -- not set
+  annotations:
+
+  # -- (string) Ingress TLS secret name
+  # @default -- not set
+  # @raw
+  #
+  # If set, TLS will be enabled for the ingress
+  #
+  tlsSecretName:
+
+httpRoute:
+  # -- (bool) Enable httpRoute for the server
+  # @raw
+  #
+  # [Kubernetes docs](https://gateway-api.sigs.k8s.io/api-types/httproute/)
+  #
+  enabled: false
+
+  # -- (array) HTTPRoute host configuration (Required for httpRoute)
+  # @default -- not set
+  host:
+
+  # -- (string) HTTPRoute parent references
+  # @default -- not set
+  # @raw
+  #
+  # Example:
+  # ```yaml
+  # parentRefs:
+  #   - name: my-gateway
+  #     namespace: my-namespace
+  #     kind: Gateway
+  #     group: gateway.networking.k8s.io
+  # ```
+  #
+  parentRefs:
+
+  # -- (object) HTTPRoute annotations
+  # @default -- not set
+  annotations:
+
+serviceAccount:
+  # -- (bool) Create a service account
+  create: false
+
+  # -- (bool) Automount the service account token
+  automount: true
+
+  # -- (object) Annotations for the service account
+  # @default -- not set
+  annotations:
+
+  # -- (string) Name of the service account
+  # @default -- derived from the chart parameters and metadata
+  name:
